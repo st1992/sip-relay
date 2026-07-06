@@ -23,11 +23,12 @@ const uploadContentType = "audio/basic"
 var objectPartCleaner = regexp.MustCompile(`[^a-zA-Z0-9._=-]+`)
 
 type Entry struct {
-	CallID    string    `json:"call_id"`
-	ANI       string    `json:"ani"`
-	DNIS      string    `json:"dnis"`
-	StartedAt time.Time `json:"started_at"`
-	EndedAt   time.Time `json:"ended_at"`
+	CallID    string              `json:"call_id"`
+	ANI       string              `json:"ani"`
+	DNIS      string              `json:"dnis"`
+	StartedAt time.Time           `json:"started_at"`
+	EndedAt   time.Time           `json:"ended_at"`
+	Metadata  map[string][]string `json:"metadata,omitempty"`
 }
 
 type Recorder struct {

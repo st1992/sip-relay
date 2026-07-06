@@ -16,9 +16,10 @@ import (
 const finalizationTimeout = 2 * time.Minute
 
 type Metadata struct {
-	CallID string
-	ANI    string
-	DNIS   string
+	CallID  string
+	ANI     string
+	DNIS    string
+	Headers map[string][]string
 }
 
 type Call struct {
@@ -182,6 +183,7 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 		DNIS:      c.Metadata.DNIS,
 		StartedAt: startedAt,
 		EndedAt:   endedAt,
+		Metadata:  c.Metadata.Headers,
 	}); err != nil {
 		c.Log.Error("failed to publish call log", "error", err)
 	}

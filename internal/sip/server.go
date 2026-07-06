@@ -208,9 +208,10 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 
 	sessionID := sessionID(s.cfg.CES.SessionPrefix, callID, localTag)
 	metadata := call.Metadata{
-		CallID: callID,
-		ANI:    ani(req),
-		DNIS:   dnis(req),
+		CallID:  callID,
+		ANI:     ani(req),
+		DNIS:    dnis(req),
+		Headers: headers(req),
 	}
 	c := call.New(sessionID, metadata, s.cfg, port, s.log.With("call_id", callID, "session_id", sessionID))
 	e := &entry{
@@ -363,6 +364,17 @@ func dnis(req *sipmsg.Request) string {
 		return to.Address.User
 	}
 	return ""
+}
+
+func headers(req *sipmsg.Request) map[string][]string {
+	if req == nil {
+		return nil
+	}
+	out := make(map[string][]string)
+	for _, header := range req.Headers() {
+		out[header.Name()] = append(out[header.Name()], header.Value())
+	}
+	return out
 }
 
 func respond(req *sipmsg.Request, tx sipmsg.ServerTransaction, status sipmsg.StatusCode, reason string, body []byte) {

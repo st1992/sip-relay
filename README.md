@@ -14,7 +14,7 @@ Use application default credentials or set `ces.credentials_file` to a Google se
 
 ## Call Logs And Recordings
 
-Set `call_log.pubsub_topic_id` to publish a JSON call log when a call ends. The message contains `call_id`, `ani`, `dnis`, `started_at`, and `ended_at`. `call_log.pubsub_project_id` is optional and defaults to `ces.project_id`.
+Set `call_log.pubsub_topic_id` to publish a JSON call log when a call ends. The message contains `call_id`, `ani`, `dnis`, `started_at`, `ended_at`, and `metadata`. For now, `metadata` contains all SIP headers from the inbound `INVITE` as header names mapped to arrays of values. `call_log.pubsub_project_id` is optional and defaults to `ces.project_id`.
 
 Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects are stored under the CES app ID as `<ces.app_id>/<call_id>.ulaw`.
 
