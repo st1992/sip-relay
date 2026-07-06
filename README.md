@@ -25,3 +25,10 @@ Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects
 - CES `SessionOutput.Audio` bytes are packetized into outbound RTP using the negotiated PCMU payload type.
 - Outbound RTP timestamps advance by the number of PCMU payload bytes sent.
 
+docker run --rm \
+  -p 5060:5060/tcp \
+  -p 5060:5060/udp \
+  -p 10000-20000:10000-20000/udp \
+  -v "$(pwd)/config.example.yaml:/etc/sip-relay/config.yaml:ro" \
+  -v "$(pwd)/credentials.json:/etc/sip-relay/credentials.json:ro" \
+  sip-relay
