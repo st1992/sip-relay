@@ -13,7 +13,10 @@ import (
 	relayrtp "sip-relay/internal/rtp"
 )
 
-const finalizationTimeout = 2 * time.Minute
+const (
+	cesConnectTimeout   = 15 * time.Second
+	finalizationTimeout = 2 * time.Minute
+)
 
 type Metadata struct {
 	CallID  string
@@ -77,23 +80,24 @@ func (c *Call) run(ctx context.Context) {
 	}
 	defer c.finish(startedAt, recorder)
 
-	stream, err := ces.Dial(ctx, ces.Options{
-		Config:    c.Config.CES,
-		SessionID: c.ID,
-		Log:       c.Log,
-	})
+	c.Log.Info("opening CES stream")
+	stream, cancelCES, err := c.dialCES(ctx)
 	if err != nil {
 		c.Log.Error("failed to open CES stream", "error", err)
 		return
 	}
+	defer cancelCES()
 	defer stream.Close()
+	c.Log.Info("CES stream opened")
 
 	rtpErr := make(chan error, 1)
 	go func() {
+		c.Log.Info("starting RTP media loop")
 		err := c.RTP.Run(ctx)
 		if errors.Is(err, context.Canceled) {
 			err = nil
 		}
+		c.Log.Info("RTP media loop stopped", "error", err)
 		rtpErr <- err
 	}()
 
@@ -121,6 +125,7 @@ func (c *Call) run(ctx context.Context) {
 			if !ok {
 				return
 			}
+			c.Log.Debug("received RTP audio payload", "bytes", len(payload))
 			if err := recorder.Write(payload); err != nil {
 				c.Log.Warn("failed to write inbound call recording", "error", err)
 			}
@@ -140,6 +145,7 @@ func (c *Call) run(ctx context.Context) {
 			}
 			switch event.Type {
 			case ces.EventAudio:
+				c.Log.Debug("received CES audio payload", "bytes", len(event.Audio))
 				if err := recorder.Write(event.Audio); err != nil {
 					c.Log.Warn("failed to write outbound call recording", "error", err)
 				}
@@ -161,6 +167,49 @@ func (c *Call) run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (c *Call) dialCES(ctx context.Context) (ces.Stream, context.CancelFunc, error) {
+	dialCtx, cancel := context.WithCancel(ctx)
+	results := make(chan dialResult, 1)
+	go func() {
+		stream, err := ces.Dial(dialCtx, ces.Options{
+			Config:    c.Config.CES,
+			SessionID: c.ID,
+			Log:       c.Log,
+		})
+		if dialCtx.Err() != nil {
+			if stream != nil {
+				_ = stream.Close()
+			}
+			return
+		}
+		result := dialResult{stream: stream, err: err}
+		results <- result
+	}()
+
+	timer := time.NewTimer(cesConnectTimeout)
+	defer timer.Stop()
+
+	select {
+	case result := <-results:
+		if result.err != nil {
+			cancel()
+			return nil, nil, result.err
+		}
+		return result.stream, cancel, nil
+	case <-timer.C:
+		cancel()
+		return nil, nil, errors.New("timed out opening CES stream")
+	case <-ctx.Done():
+		cancel()
+		return nil, nil, ctx.Err()
+	}
+}
+
+type dialResult struct {
+	stream ces.Stream
+	err    error
 }
 
 func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {

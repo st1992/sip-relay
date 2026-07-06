@@ -83,6 +83,7 @@ func (s *Server) Start(ctx context.Context) error {
 	srv.OnNoRoute(s.onNoRoute)
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.SIP.ListenIP, s.cfg.SIP.ListenPort)
+	s.log.Info("starting SIP listeners", "addr", addr)
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return err
@@ -93,6 +94,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.udp = udpConn
 	go func() {
+		s.log.Info("SIP UDP listener started", "addr", addr)
 		if err := srv.ServeUDP(udpConn); err != nil {
 			s.log.Error("SIP UDP listener stopped", "error", err)
 		}
@@ -105,6 +107,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	s.listeners = append(s.listeners, tcpLis)
 	go func() {
+		s.log.Info("SIP TCP listener started", "addr", addr)
 		if err := srv.ServeTCP(tcpLis); err != nil {
 			s.log.Error("SIP TCP listener stopped", "error", err)
 		}
@@ -152,12 +155,14 @@ func (s *Server) Close() {
 }
 
 func (s *Server) onOptions(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+	s.log.Info("SIP OPTIONS received", "source", req.Source())
 	_ = tx.Respond(sipmsg.NewResponseFromRequest(req, sipmsg.StatusOK, "OK", nil))
 	tx.Terminate()
 }
 
 func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 	callID := callID(req)
+	s.log.Info("SIP INVITE received", "call_id", callID, "ani", ani(req), "dnis", dnis(req), "source", req.Source())
 	if callID == "" {
 		respond(req, tx, 400, "Missing Call-ID", nil)
 		return
@@ -187,6 +192,7 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		respond(req, tx, 503, "No RTP port available", nil)
 		return
 	}
+	s.log.Info("RTP port allocated", "call_id", callID, "port", port.LocalPort())
 
 	answer, err := relaysdp.AnswerOffer(req.Body(), advertisedIP, port.LocalPort())
 	if err != nil {
@@ -218,7 +224,7 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		localTag: localTag,
 		callID:   callID,
 		call:     c,
-		ack:      make(chan struct{}),
+		ack:      make(chan struct{}, 1),
 	}
 	s.store(e)
 
@@ -228,11 +234,13 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 	}
 	resp.AppendHeader(sipmsg.NewHeader("Content-Type", "application/sdp"))
 	resp.AppendHeader(sipmsg.NewHeader("Contact", s.contactHeader()))
+	s.log.Info("responding to SIP INVITE", "call_id", callID, "session_id", sessionID)
 	if err := tx.Respond(resp); err != nil {
 		s.remove(e)
 		c.Close()
 		return
 	}
+	s.log.Info("SIP INVITE accepted; waiting for ACK", "call_id", callID, "session_id", sessionID)
 
 	go s.awaitACK(context.Background(), e, tx)
 	go func() {
@@ -244,8 +252,10 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 func (s *Server) onAck(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 	e := s.lookup(req)
 	if e == nil {
+		s.log.Warn("SIP ACK received for unknown call", "call_id", callID(req))
 		return
 	}
+	s.log.Info("SIP ACK received", "call_id", e.callID)
 	select {
 	case e.ack <- struct{}{}:
 	default:
@@ -254,6 +264,7 @@ func (s *Server) onAck(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTr
 
 func (s *Server) onBye(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 	e := s.lookup(req)
+	s.log.Info("SIP BYE received", "call_id", callID(req))
 	_ = tx.Respond(sipmsg.NewResponseFromRequest(req, sipmsg.StatusOK, "OK", nil))
 	tx.Terminate()
 	if e == nil {
@@ -266,6 +277,7 @@ func (s *Server) onBye(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTr
 }
 
 func (s *Server) onNoRoute(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+	s.log.Info("SIP request received with no route", "method", req.Method, "call_id", callID(req))
 	if req.Method == sipmsg.CANCEL {
 		_ = tx.Respond(sipmsg.NewResponseFromRequest(req, sipmsg.StatusOK, "OK", nil))
 		tx.Terminate()

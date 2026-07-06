@@ -158,12 +158,14 @@ func dialGRPC(ctx context.Context, opts Options) (*grpcStream, error) {
 		clientOpts = append(clientOpts, option.WithCredentialsFile(opts.Config.CredentialsFile))
 	}
 
+	opts.Log.Info("creating CES gRPC client", "endpoint", opts.Config.Endpoint, "location", opts.Config.Location)
 	client, err := cesapi.NewSessionClient(ctx, clientOpts...)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 
+	opts.Log.Info("opening CES BidiRunSession")
 	ctx = metadata.AppendToOutgoingContext(ctx, "x-goog-request-params", "location=locations/"+opts.Config.Location)
 	rpcStream, err := client.BidiRunSession(ctx)
 	if err != nil {
@@ -171,11 +173,13 @@ func dialGRPC(ctx context.Context, opts Options) (*grpcStream, error) {
 		cancel()
 		return nil, err
 	}
+	opts.Log.Info("sending CES session config")
 	if err := rpcStream.Send(ConfigMessage(opts.Config, opts.SessionID)); err != nil {
 		_ = client.Close()
 		cancel()
 		return nil, err
 	}
+	opts.Log.Info("CES session config sent")
 
 	out := &grpcStream{baseStream: newBaseStream(cancel), client: client}
 	go out.sendLoop(rpcStream)
@@ -233,6 +237,7 @@ type wsStream struct {
 
 func dialWebSocket(ctx context.Context, opts Options) (*wsStream, error) {
 	ctx, cancel := context.WithCancel(ctx)
+	opts.Log.Info("creating CES WebSocket token source", "endpoint", opts.Config.Endpoint, "location", opts.Config.Location)
 	tokenSource, err := tokenSource(ctx, opts.Config)
 	if err != nil {
 		cancel()
@@ -247,6 +252,7 @@ func dialWebSocket(ctx context.Context, opts Options) (*wsStream, error) {
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+token.AccessToken)
 	header.Set("x-goog-request-params", "location=locations/"+opts.Config.Location)
+	opts.Log.Info("opening CES WebSocket", "url", websocketURL(opts.Config))
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, websocketURL(opts.Config), header)
 	if err != nil {
 		cancel()
@@ -254,11 +260,13 @@ func dialWebSocket(ctx context.Context, opts Options) (*wsStream, error) {
 	}
 
 	out := &wsStream{baseStream: newBaseStream(cancel), conn: conn}
+	opts.Log.Info("sending CES WebSocket session config")
 	if err := out.writeProto(ConfigMessage(opts.Config, opts.SessionID)); err != nil {
 		_ = conn.Close()
 		cancel()
 		return nil, err
 	}
+	opts.Log.Info("CES WebSocket session config sent")
 	go out.sendLoop()
 	go out.recvLoop(opts.Log)
 	return out, nil

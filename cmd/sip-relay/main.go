@@ -22,10 +22,12 @@ func main() {
 		log.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
+	log.Info("config loaded", "config", *configPath, "sip_addr", cfg.SIP.ListenIP, "sip_port", cfg.SIP.ListenPort)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	log.Info("starting SIP relay")
 	server := relaysip.NewServer(cfg, log)
 	if err := server.Start(ctx); err != nil {
 		log.Error("failed to start SIP relay", "error", err)
