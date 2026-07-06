@@ -1,4 +1,7 @@
-FROM golang:1.25-bookworm AS builder
+# syntax=docker/dockerfile:1
+
+# ---- Build stage ----
+FROM golang:1.25-alpine AS build
 
 WORKDIR /src
 
@@ -7,17 +10,36 @@ ENV CGO_ENABLED=0 \
     GOFLAGS=-p=1 \
     GOMAXPROCS=2
 
+# Cache module downloads separately from the source.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
+# Build the static binary.
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/sip-relay ./cmd/sip-relay
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go build -trimpath \
+    -ldflags="-s -w" \
+    -o /out/sip-relay ./cmd/sip-relay
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# ---- Runtime stage ----
+# Debian slim keeps debugging tools available, especially sngrep for SIP traces.
+FROM debian:bookworm-slim
 
-WORKDIR /
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        tzdata \
+        sngrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system siprelay \
+    && useradd --system --gid siprelay --home-dir /app --shell /usr/sbin/nologin siprelay
 
-COPY --from=builder /out/sip-relay /sip-relay
+WORKDIR /app
+
+COPY --from=build /out/sip-relay /usr/local/bin/sip-relay
+COPY config.example.yaml /app/config.yaml
 
 ENV GOMEMLIMIT=512MiB \
     GOGC=75
@@ -26,7 +48,12 @@ EXPOSE 5060/tcp
 EXPOSE 5060/udp
 EXPOSE 10000-20000/udp
 
-USER nonroot:nonroot
+RUN chown -R siprelay:siprelay /app
 
-ENTRYPOINT ["/sip-relay"]
-CMD ["--config", "/etc/sip-relay/config.yaml"]
+USER siprelay
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD [ "sh", "-c", "kill -0 1 && grep -q 'sip-relay' /proc/1/cmdline" ]
+
+ENTRYPOINT ["sip-relay"]
+CMD ["--config", "/app/config.yaml"]
