@@ -12,6 +12,29 @@ go run ./cmd/sip-relay --config config.example.yaml
 
 Use application default credentials or set `ces.credentials_file` to a Google service account JSON file with access to the CES API.
 
+## Docker
+
+Build the image:
+
+```sh
+docker build -t sip-relay .
+```
+
+The Dockerfile limits Go compiler parallelism to avoid high memory use during builds. If runtime memory is tight, override `GOMEMLIMIT` in `docker run`.
+
+Run with config and credentials mounted:
+
+```sh
+docker run --rm \
+  -p 5060:5060/tcp \
+  -p 5060:5060/udp \
+  -p 10000-20000:10000-20000/udp \
+  -e GOMEMLIMIT=512MiB \
+  -v "$(pwd)/config.example.yaml:/etc/sip-relay/config.yaml:ro" \
+  -v "$(pwd)/credentials.json:/etc/sip-relay/credentials.json:ro" \
+  sip-relay
+```
+
 ## Call Logs And Recordings
 
 Set `call_log.pubsub_topic_id` to publish a JSON call log when a call ends. The message contains `call_id`, `ani`, `dnis`, `started_at`, `ended_at`, and `metadata`. For now, `metadata` contains all SIP headers from the inbound `INVITE` as header names mapped to arrays of values. `call_log.pubsub_project_id` is optional and defaults to `ces.project_id`.
@@ -24,11 +47,3 @@ Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects
 - Incoming RTP payload bytes are batched into CES `SessionInput.Audio` messages with `AudioEncoding_MULAW`.
 - CES `SessionOutput.Audio` bytes are packetized into outbound RTP using the negotiated PCMU payload type.
 - Outbound RTP timestamps advance by the number of PCMU payload bytes sent.
-
-docker run --rm \
-  -p 5060:5060/tcp \
-  -p 5060:5060/udp \
-  -p 10000-20000:10000-20000/udp \
-  -v "$(pwd)/config.example.yaml:/etc/sip-relay/config.yaml:ro" \
-  -v "$(pwd)/credentials.json:/etc/sip-relay/credentials.json:ro" \
-  sip-relay

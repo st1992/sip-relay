@@ -1,0 +1,12 @@
+.git
+.gitignore
+
+credentials.json
+*.json
+*.key
+*.pem
+
+tmp
+*.log
+*.ulaw
+
