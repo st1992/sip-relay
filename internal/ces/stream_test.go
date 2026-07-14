@@ -1,6 +1,7 @@
 package ces
 
 import (
+	"errors"
 	"testing"
 
 	cespb "cloud.google.com/go/ces/apiv1/cespb"
@@ -49,5 +50,35 @@ func TestAudioMessageCopiesPayload(t *testing.T) {
 	got := msg.GetRealtimeInput().GetAudio()
 	if string(got) != string([]byte{1, 2, 3}) {
 		t.Fatalf("audio payload = %v", got)
+	}
+}
+
+func TestTextMessageUsesRealtimeTextInput(t *testing.T) {
+	msg := TextMessage("hello")
+
+	got := msg.GetRealtimeInput().GetText()
+	if got != "hello" {
+		t.Fatalf("text input = %q, want hello", got)
+	}
+}
+
+func TestBaseStreamClosedSignalDoesNotConsumeDoneError(t *testing.T) {
+	stream := newBaseStream(func() {})
+	want := errors.New("stream failed")
+
+	stream.finish(want)
+
+	select {
+	case <-stream.closed:
+	default:
+		t.Fatal("stream closed signal was not closed")
+	}
+
+	got, ok := <-stream.Done()
+	if !ok {
+		t.Fatal("stream done channel closed before result was read")
+	}
+	if !errors.Is(got, want) {
+		t.Fatalf("stream done error = %v, want %v", got, want)
 	}
 }

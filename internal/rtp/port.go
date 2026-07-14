@@ -8,17 +8,22 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mathrand "math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	pionrtp "github.com/pion/rtp"
 )
 
 const (
-	SampleRate = 8000
-	mtuSize    = 1500
+	SampleRate      = 8000
+	FrameDuration   = 20 * time.Millisecond
+	FramesPerSec    = int(time.Second / FrameDuration)
+	SamplesPerFrame = SampleRate / FramesPerSec
+	mtuSize         = 1500
 )
 
 type Config struct {
@@ -28,6 +33,7 @@ type Config struct {
 	SymmetricRTP        bool
 	PayloadType         uint8
 	OutboundPacketBytes int
+	OutboundPacketEvery time.Duration
 	MediaTimeoutInitial time.Duration
 	MediaTimeout        time.Duration
 	Log                 *slog.Logger
@@ -39,6 +45,7 @@ type Port struct {
 	payloadType  uint8
 	symmetricRTP bool
 	packetBytes  int
+	packetEvery  time.Duration
 	initialTO    time.Duration
 	mediaTO      time.Duration
 	remote       atomic.Pointer[net.UDPAddr]
@@ -48,6 +55,12 @@ type Port struct {
 	seq     uint16
 	ts      uint32
 	ssrc    uint32
+	nextAt  time.Time
+	paceSeq uint64
+
+	interruptMu  sync.Mutex
+	interruptCh  chan struct{}
+	interruptSeq atomic.Uint64
 
 	received       chan []byte
 	firstPacket    chan struct{}
@@ -69,7 +82,10 @@ func Listen(conf Config) (*Port, error) {
 		conf.MediaTimeout = 15 * time.Second
 	}
 	if conf.OutboundPacketBytes <= 0 {
-		conf.OutboundPacketBytes = 160
+		conf.OutboundPacketBytes = SamplesPerFrame
+	}
+	if conf.OutboundPacketEvery <= 0 {
+		conf.OutboundPacketEvery = FrameDuration
 	}
 
 	conn, err := listenUDPRange(conf.ListenIP, conf.PortMin, conf.PortMax)
@@ -84,6 +100,7 @@ func Listen(conf Config) (*Port, error) {
 		payloadType:  conf.PayloadType,
 		symmetricRTP: conf.SymmetricRTP,
 		packetBytes:  conf.OutboundPacketBytes,
+		packetEvery:  conf.OutboundPacketEvery,
 		initialTO:    conf.MediaTimeoutInitial,
 		mediaTO:      conf.MediaTimeout,
 		seq:          seq,
@@ -91,6 +108,7 @@ func Listen(conf Config) (*Port, error) {
 		ssrc:         randomUint32(),
 		received:     make(chan []byte, 128),
 		firstPacket:  make(chan struct{}),
+		interruptCh:  make(chan struct{}),
 	}
 	return port, nil
 }
@@ -158,17 +176,46 @@ func (p *Port) WritePayload(payload []byte) error {
 	if len(payload) == 0 {
 		return nil
 	}
+	interruptSeq := p.interruptSeq.Load()
+
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
 	for len(payload) > 0 {
+		if p.outboundInterrupted(interruptSeq) {
+			return nil
+		}
+		if p.paceSeq != interruptSeq {
+			p.nextAt = time.Time{}
+			p.paceSeq = interruptSeq
+		}
 		n := len(payload)
 		if n > p.packetBytes {
 			n = p.packetBytes
 		}
-		if err := p.writePacket(payload[:n]); err != nil {
+		if err := p.writePacketLocked(payload[:n], interruptSeq); err != nil {
+			if errors.Is(err, errOutboundInterrupted) {
+				return nil
+			}
 			return err
 		}
 		payload = payload[n:]
 	}
 	return nil
+}
+
+func (p *Port) InterruptOutbound() {
+	if p == nil {
+		return
+	}
+	p.interruptSeq.Add(1)
+
+	p.interruptMu.Lock()
+	if p.interruptCh != nil {
+		close(p.interruptCh)
+	}
+	p.interruptCh = make(chan struct{})
+	p.interruptMu.Unlock()
 }
 
 func (p *Port) Close() error {
@@ -213,14 +260,25 @@ func (p *Port) readLoop() error {
 	}
 }
 
-func (p *Port) writePacket(payload []byte) error {
+var errOutboundInterrupted = errors.New("outbound RTP interrupted")
+
+func (p *Port) writePacketLocked(payload []byte, interruptSeq uint64) error {
 	remote := p.remote.Load()
 	if remote == nil {
 		return nil
 	}
 
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
+	if p.packetEvery > 0 {
+		now := time.Now()
+		if !p.nextAt.IsZero() && now.Before(p.nextAt) {
+			if p.waitForOutboundTurn(time.Until(p.nextAt), interruptSeq) {
+				return errOutboundInterrupted
+			}
+		}
+	}
+	if p.outboundInterrupted(interruptSeq) {
+		return errOutboundInterrupted
+	}
 
 	header := pionrtp.Header{
 		Version:        2,
@@ -237,7 +295,40 @@ func (p *Port) writePacket(payload []byte) error {
 		return err
 	}
 	_, err = p.conn.WriteToUDP(raw, remote)
+	if err == nil && p.packetEvery > 0 {
+		p.nextAt = time.Now().Add(p.packetEvery)
+	}
 	return err
+}
+
+func (p *Port) waitForOutboundTurn(d time.Duration, interruptSeq uint64) bool {
+	if d <= 0 {
+		return p.outboundInterrupted(interruptSeq)
+	}
+	if p.outboundInterrupted(interruptSeq) {
+		return true
+	}
+
+	p.interruptMu.Lock()
+	interruptCh := p.interruptCh
+	p.interruptMu.Unlock()
+	if p.outboundInterrupted(interruptSeq) {
+		return true
+	}
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return p.outboundInterrupted(interruptSeq)
+	case <-interruptCh:
+		return true
+	}
+}
+
+func (p *Port) outboundInterrupted(interruptSeq uint64) bool {
+	return p.interruptSeq.Load() != interruptSeq
 }
 
 func listenUDPRange(listenIP string, minPort, maxPort int) (*net.UDPConn, error) {
@@ -245,16 +336,34 @@ func listenUDPRange(listenIP string, minPort, maxPort int) (*net.UDPConn, error)
 	if ip == nil {
 		return nil, fmt.Errorf("invalid RTP listen IP %q", listenIP)
 	}
-	if minPort == 0 && maxPort == 0 {
-		return net.ListenUDP("udp", &net.UDPAddr{IP: ip})
+	if minPort <= 0 {
+		minPort = 1
 	}
-	for port := minPort; port <= maxPort; port++ {
+	if maxPort <= 0 || maxPort > 0xFFFF {
+		maxPort = 0xFFFF
+	}
+	evenMin := (minPort + 1) &^ 1
+	evenMax := maxPort &^ 1
+	if evenMin > evenMax {
+		return nil, fmt.Errorf("no free even UDP port in range %d-%d", minPort, maxPort)
+	}
+
+	ports := (evenMax-evenMin)/2 + 1
+	port := evenMin + 2*mathrand.Intn(ports)
+	for try := 0; try < ports; try++ {
 		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: ip, Port: port})
 		if err == nil {
 			return conn, nil
 		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, err
+		}
+		port += 2
+		if port > evenMax {
+			port = evenMin
+		}
 	}
-	return nil, fmt.Errorf("no free UDP port in range %d-%d", minPort, maxPort)
+	return nil, fmt.Errorf("no free even UDP port in range %d-%d", minPort, maxPort)
 }
 
 func randomUint32() uint32 {

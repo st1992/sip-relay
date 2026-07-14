@@ -31,6 +31,7 @@ type Server struct {
 	log *slog.Logger
 
 	ua        *sipgo.UserAgent
+	cli       *sipgo.Client
 	srv       *sipgo.Server
 	listeners []net.Listener
 	udp       *net.UDPConn
@@ -45,9 +46,15 @@ type entry struct {
 	localTag string
 	callID   string
 	call     *call.Call
+	dialog   *dialog
 	start    sync.Once
 	close    sync.Once
 	ack      chan struct{}
+}
+
+type dialog struct {
+	invite *sipmsg.Request
+	ok     *sipmsg.Response
 }
 
 func NewServer(cfg *config.Config, log *slog.Logger) *Server {
@@ -65,11 +72,21 @@ func NewServer(cfg *config.Config, log *slog.Logger) *Server {
 func (s *Server) Start(ctx context.Context) error {
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgent(s.cfg.SIP.UserAgent),
+		sipgo.WithUserAgentIP(net.ParseIP(s.cfg.SIP.AdvertisedIP)),
 	)
 	if err != nil {
 		return err
 	}
 	s.ua = ua
+	cli, err := sipgo.NewClient(
+		ua,
+		sipgo.WithClientHostname(s.cfg.SIP.AdvertisedIP),
+		sipgo.WithClientPort(s.cfg.SIP.ListenPort),
+	)
+	if err != nil {
+		return err
+	}
+	s.cli = cli
 
 	srv, err := sipgo.NewServer(ua)
 	if err != nil {
@@ -149,6 +166,9 @@ func (s *Server) Close() {
 	if s.srv != nil {
 		_ = s.srv.Close()
 	}
+	if s.cli != nil {
+		_ = s.cli.Close()
+	}
 	if s.ua != nil {
 		s.ua.Close()
 	}
@@ -162,13 +182,21 @@ func (s *Server) onOptions(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serv
 
 func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
 	callID := callID(req)
-	s.log.Info("SIP INVITE received", "call_id", callID, "ani", ani(req), "dnis", dnis(req), "source", req.Source())
+	extension := dnis(req)
+	s.log.Info("SIP INVITE received", "call_id", callID, "ani", ani(req), "dnis", extension, "source", req.Source())
+	respondTrying(req, tx)
 	if callID == "" {
 		respond(req, tx, 400, "Missing Call-ID", nil)
 		return
 	}
 	if len(req.Body()) == 0 {
 		respond(req, tx, 400, "Missing SDP", nil)
+		return
+	}
+	cesConfig, ok := s.cfg.CES.ForExtension(extension)
+	if !ok {
+		s.log.Warn("rejecting SIP INVITE for unconfigured extension", "call_id", callID, "extension", extension)
+		respond(req, tx, 404, "Unknown extension", nil)
 		return
 	}
 
@@ -180,13 +208,12 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 
 	localTag := randomTag()
 	port, err := relayrtp.Listen(relayrtp.Config{
-		ListenIP:            s.cfg.RTP.ListenIP,
-		PortMin:             s.cfg.RTP.PortMin,
-		PortMax:             s.cfg.RTP.PortMax,
-		SymmetricRTP:        s.cfg.RTP.SymmetricRTP,
-		PayloadType:         0,
-		OutboundPacketBytes: s.cfg.RTP.OutboundPacketMS * relayrtp.SampleRate / 1000,
-		Log:                 s.log,
+		ListenIP:     s.cfg.RTP.ListenIP,
+		PortMin:      s.cfg.RTP.PortMin,
+		PortMax:      s.cfg.RTP.PortMax,
+		SymmetricRTP: s.cfg.RTP.SymmetricRTP,
+		PayloadType:  0,
+		Log:          s.log,
 	})
 	if err != nil {
 		respond(req, tx, 503, "No RTP port available", nil)
@@ -212,14 +239,16 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		return
 	}
 
-	sessionID := sessionID(s.cfg.CES.SessionPrefix, callID, localTag)
+	sessionID := sessionID(cesConfig.SessionPrefix, callID, localTag)
 	metadata := call.Metadata{
 		CallID:  callID,
 		ANI:     ani(req),
-		DNIS:    dnis(req),
+		DNIS:    extension,
 		Headers: headers(req),
 	}
-	c := call.New(sessionID, metadata, s.cfg, port, s.log.With("call_id", callID, "session_id", sessionID))
+	callConfig := *s.cfg
+	callConfig.CES = cesConfig
+	c := call.New(sessionID, metadata, &callConfig, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension))
 	e := &entry{
 		localTag: localTag,
 		callID:   callID,
@@ -234,6 +263,7 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 	}
 	resp.AppendHeader(sipmsg.NewHeader("Content-Type", "application/sdp"))
 	resp.AppendHeader(sipmsg.NewHeader("Contact", s.contactHeader()))
+	e.dialog = &dialog{invite: req.Clone(), ok: resp.Clone()}
 	s.log.Info("responding to SIP INVITE", "call_id", callID, "session_id", sessionID)
 	if err := tx.Respond(resp); err != nil {
 		s.remove(e)
@@ -245,6 +275,13 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 	go s.awaitACK(context.Background(), e, tx)
 	go func() {
 		<-c.Done()
+		if c.EndReason() == call.EndReasonCESEnded {
+			e.close.Do(func() {
+				s.sendBYE(e)
+				s.remove(e)
+			})
+			return
+		}
 		s.remove(e)
 	}()
 }
@@ -271,7 +308,7 @@ func (s *Server) onBye(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTr
 		return
 	}
 	e.close.Do(func() {
-		e.call.Close()
+		e.call.CloseWithReason(call.EndReasonUser)
 		s.remove(e)
 	})
 }
@@ -307,7 +344,7 @@ func (s *Server) awaitACK(ctx context.Context, e *entry, tx sipmsg.ServerTransac
 		})
 	case cancelReq := <-tx.Cancels():
 		_ = tx.Respond(sipmsg.NewResponseFromRequest(cancelReq, sipmsg.StatusOK, "OK", nil))
-		e.call.Close()
+		e.call.CloseWithReason(call.EndReasonUser)
 		s.remove(e)
 	case <-timer.C:
 		s.log.Warn("timed out waiting for ACK", "call_id", e.callID)
@@ -348,6 +385,89 @@ func (s *Server) lookup(req *sipmsg.Request) *entry {
 		return s.byCall[id]
 	}
 	return nil
+}
+
+func (s *Server) sendBYE(e *entry) {
+	if e == nil || e.dialog == nil || s.cli == nil {
+		return
+	}
+	req := newServerBYE(e.dialog)
+	if req == nil {
+		s.log.Warn("cannot send SIP BYE; dialog is incomplete", "call_id", e.callID)
+		return
+	}
+
+	s.log.Info("sending SIP BYE after CES ended session", "call_id", e.callID)
+	tx, err := s.cli.TransactionRequest(req)
+	if err != nil {
+		s.log.Warn("failed to send SIP BYE", "call_id", e.callID, "error", err)
+		return
+	}
+	defer tx.Terminate()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case resp := <-tx.Responses():
+			if resp != nil && resp.StatusCode >= 200 {
+				s.log.Info("SIP BYE completed", "call_id", e.callID, "status", resp.StatusCode)
+				return
+			}
+		case <-tx.Done():
+			return
+		case <-timer.C:
+			s.log.Warn("timed out waiting for SIP BYE response", "call_id", e.callID)
+			return
+		}
+	}
+}
+
+func newServerBYE(d *dialog) *sipmsg.Request {
+	if d == nil || d.invite == nil || d.ok == nil {
+		return nil
+	}
+
+	recipient := d.invite.Recipient
+	if contact := d.invite.Contact(); contact != nil {
+		recipient = *contact.Address.Clone()
+	} else if from := d.invite.From(); from != nil {
+		recipient = *from.Address.Clone()
+	}
+
+	req := sipmsg.NewRequest(sipmsg.BYE, recipient)
+	req.SipVersion = d.invite.SipVersion
+
+	for _, header := range d.invite.GetHeaders("Record-Route") {
+		req.AppendHeader(sipmsg.NewHeader("Route", header.Value()))
+	}
+
+	maxForwards := sipmsg.MaxForwardsHeader(70)
+	req.AppendHeader(&maxForwards)
+	if to := d.ok.To(); to != nil {
+		from := to.AsFrom()
+		req.AppendHeader(&from)
+	}
+	if from := d.invite.From(); from != nil {
+		to := from.AsTo()
+		req.AppendHeader(&to)
+	}
+	if callID := d.invite.CallID(); callID != nil {
+		req.AppendHeader(sipmsg.HeaderClone(callID))
+	}
+	cseqNo := uint32(1)
+	if cseq := d.invite.CSeq(); cseq != nil {
+		cseqNo = cseq.SeqNo + 1
+	}
+	req.AppendHeader(&sipmsg.CSeqHeader{SeqNo: cseqNo, MethodName: sipmsg.BYE})
+	if contact := d.ok.Contact(); contact != nil {
+		req.AppendHeader(sipmsg.HeaderClone(contact))
+	}
+
+	req.SetBody(nil)
+	req.SetTransport(d.invite.Transport())
+	req.SetDestination(d.invite.Source())
+	return req
 }
 
 func (s *Server) contactHeader() string {
@@ -396,6 +516,10 @@ func respond(req *sipmsg.Request, tx sipmsg.ServerTransaction, status sipmsg.Sta
 	}
 	_ = tx.Respond(resp)
 	tx.Terminate()
+}
+
+func respondTrying(req *sipmsg.Request, tx sipmsg.ServerTransaction) {
+	_ = tx.Respond(sipmsg.NewResponseFromRequest(req, sipmsg.StatusTrying, "Trying", nil))
 }
 
 func randomTag() string {

@@ -20,8 +20,6 @@ Build the image:
 docker build -t sip-relay .
 ```
 
-The Dockerfile limits Go compiler parallelism to avoid high memory use during builds. If runtime memory is tight, override `GOMEMLIMIT` in `docker run`.
-
 The runtime image includes `sngrep` for SIP inspection inside containers.
 
 Run with config and credentials mounted:
@@ -31,13 +29,14 @@ docker run --rm \
   -p 5060:5060/tcp \
   -p 5060:5060/udp \
   -p 10000-20000:10000-20000/udp \
-  -e GOMEMLIMIT=512MiB \
   -v "$(pwd)/config.example.yaml:/app/config.yaml:ro" \
   -v "$(pwd)/credentials.json:/app/credentials.json:ro" \
   sip-relay
 ```
 
 When mounting credentials this way, set `ces.credentials_file` to `/app/credentials.json` in the mounted config.
+
+If your deployment needs explicit memory tuning, pass Go runtime settings such as `GOMEMLIMIT` or `GOGC` with `docker run -e`.
 
 ## Call Logs And Recordings
 

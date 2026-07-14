@@ -23,12 +23,16 @@ const uploadContentType = "audio/basic"
 var objectPartCleaner = regexp.MustCompile(`[^a-zA-Z0-9._=-]+`)
 
 type Entry struct {
-	CallID    string              `json:"call_id"`
-	ANI       string              `json:"ani"`
-	DNIS      string              `json:"dnis"`
-	StartedAt time.Time           `json:"started_at"`
-	EndedAt   time.Time           `json:"ended_at"`
-	Metadata  map[string][]string `json:"metadata,omitempty"`
+	ProjectID      string    `json:"project_id"`
+	Location       string    `json:"location"`
+	AppID          string    `json:"app_id"`
+	DeploymentID   string    `json:"deployment_id"`
+	ConversationID string    `json:"conversation_id"`
+	ANI            string    `json:"ani"`
+	DNIS           string    `json:"dnis"`
+	StartTime      time.Time `json:"start_time"`
+	EndTime        time.Time `json:"end_time"`
+	HangupReason   string    `json:"hangup_reason"`
 }
 
 type Recorder struct {
@@ -134,9 +138,6 @@ func Publish(ctx context.Context, cfg *config.Config, entry Entry) error {
 	defer publisher.Stop()
 	result := publisher.Publish(ctx, &pubsub.Message{
 		Data: data,
-		Attributes: map[string]string{
-			"call_id": entry.CallID,
-		},
 	})
 	_, err = result.Get(ctx)
 	return err

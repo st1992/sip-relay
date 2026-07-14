@@ -30,7 +30,7 @@ func TestAnswerOfferAcceptsPCMUOnly(t *testing.T) {
 		t.Fatalf("payload type = %d", answer.Offer.PayloadType)
 	}
 	body := string(answer.Payload)
-	for _, want := range []string{"m=audio 12000 RTP/AVP 0", "a=rtpmap:0 PCMU/8000", "c=IN IP4 198.51.100.20"} {
+	for _, want := range []string{"m=audio 12000 RTP/AVP 0", "a=rtpmap:0 PCMU/8000", "a=ptime:20", "c=IN IP4 198.51.100.20"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("answer missing %q:\n%s", want, body)
 		}

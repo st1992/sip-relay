@@ -24,11 +24,13 @@ import (
 )
 
 const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
+const initialTextInput = "hello"
 
 type EventType int
 
 const (
 	EventAudio EventType = iota
+	EventText
 	EventRecognition
 	EventInterruption
 	EventTurnComplete
@@ -102,19 +104,31 @@ func AudioMessage(payload []byte) *cespb.BidiSessionClientMessage {
 	}
 }
 
+func TextMessage(text string) *cespb.BidiSessionClientMessage {
+	return &cespb.BidiSessionClientMessage{
+		MessageType: &cespb.BidiSessionClientMessage_RealtimeInput{
+			RealtimeInput: &cespb.SessionInput{
+				InputType: &cespb.SessionInput_Text{Text: text},
+			},
+		},
+	}
+}
+
 type baseStream struct {
 	input  chan []byte
 	events chan Event
 	done   chan error
+	closed chan struct{}
 	cancel context.CancelFunc
 	once   sync.Once
 }
 
 func newBaseStream(cancel context.CancelFunc) baseStream {
 	return baseStream{
-		input:  make(chan []byte, 128),
+		input:  make(chan []byte),
 		events: make(chan Event),
 		done:   make(chan error, 1),
+		closed: make(chan struct{}),
 		cancel: cancel,
 	}
 }
@@ -139,6 +153,7 @@ func (s *baseStream) finish(err error) {
 		s.done <- err
 		close(s.done)
 		close(s.events)
+		close(s.closed)
 		s.cancel()
 	})
 }
@@ -180,6 +195,13 @@ func dialGRPC(ctx context.Context, opts Options) (*grpcStream, error) {
 		return nil, err
 	}
 	opts.Log.Info("CES session config sent")
+	opts.Log.Info("sending initial CES text input", "text", initialTextInput)
+	if err := rpcStream.Send(TextMessage(initialTextInput)); err != nil {
+		_ = client.Close()
+		cancel()
+		return nil, err
+	}
+	opts.Log.Info("initial CES text input sent")
 
 	out := &grpcStream{baseStream: newBaseStream(cancel), client: client}
 	go out.sendLoop(rpcStream)
@@ -201,7 +223,10 @@ func (s *grpcStream) sendLoop(rpcStream cespb.SessionService_BidiRunSessionClien
 		select {
 		case <-rpcStream.Context().Done():
 			return
-		case payload := <-s.input:
+		case payload, ok := <-s.input:
+			if !ok {
+				return
+			}
 			if err := rpcStream.Send(AudioMessage(payload)); err != nil {
 				s.finish(err)
 				return
@@ -267,6 +292,13 @@ func dialWebSocket(ctx context.Context, opts Options) (*wsStream, error) {
 		return nil, err
 	}
 	opts.Log.Info("CES WebSocket session config sent")
+	opts.Log.Info("sending initial CES WebSocket text input", "text", initialTextInput)
+	if err := out.writeProto(TextMessage(initialTextInput)); err != nil {
+		_ = conn.Close()
+		cancel()
+		return nil, err
+	}
+	opts.Log.Info("initial CES WebSocket text input sent")
 	go out.sendLoop()
 	go out.recvLoop(opts.Log)
 	return out, nil
@@ -283,9 +315,12 @@ func (s *wsStream) Close() error {
 func (s *wsStream) sendLoop() {
 	for {
 		select {
-		case <-s.done:
+		case <-s.closed:
 			return
-		case payload := <-s.input:
+		case payload, ok := <-s.input:
+			if !ok {
+				return
+			}
 			if err := s.writeProto(AudioMessage(payload)); err != nil {
 				s.finish(err)
 				return
@@ -333,7 +368,7 @@ func emitServerMessage(msg *cespb.BidiSessionServerMessage, events chan<- Event,
 			events <- Event{Type: EventAudio, Audio: append([]byte(nil), audio...)}
 		}
 		if text := out.GetText(); text != "" {
-			log.Debug("CES text output", "text", text)
+			events <- Event{Type: EventText, Text: text}
 		}
 		if out.GetTurnCompleted() {
 			events <- Event{Type: EventTurnComplete}

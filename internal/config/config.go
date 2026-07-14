@@ -34,25 +34,31 @@ type RTPConfig struct {
 	PortMin             int           `yaml:"port_min"`
 	PortMax             int           `yaml:"port_max"`
 	SymmetricRTP        bool          `yaml:"symmetric_rtp"`
-	InputChunkMS        int           `yaml:"input_chunk_ms"`
-	OutboundPacketMS    int           `yaml:"outbound_packet_ms"`
 	MediaTimeoutInitial time.Duration `yaml:"media_timeout_initial"`
 	MediaTimeout        time.Duration `yaml:"media_timeout"`
 }
 
 type CESConfig struct {
-	ProjectID             string `yaml:"project_id"`
-	Location              string `yaml:"location"`
-	AppID                 string `yaml:"app_id"`
-	DeploymentID          string `yaml:"deployment_id"`
-	Endpoint              string `yaml:"endpoint"`
-	Transport             string `yaml:"transport"`
-	CredentialsFile       string `yaml:"credentials_file"`
-	SessionPrefix         string `yaml:"session_prefix"`
-	NoiseSuppressionLevel string `yaml:"noise_suppression_level"`
-	TimeZone              string `yaml:"time_zone"`
-	UseToolFakes          bool   `yaml:"use_tool_fakes"`
-	RestartOnGoAway       bool   `yaml:"restart_on_goaway"`
+	ProjectID             string                        `yaml:"project_id"`
+	Location              string                        `yaml:"location"`
+	AppID                 string                        `yaml:"app_id"`
+	DeploymentID          string                        `yaml:"deployment_id"`
+	Endpoint              string                        `yaml:"endpoint"`
+	Transport             string                        `yaml:"transport"`
+	CredentialsFile       string                        `yaml:"credentials_file"`
+	SessionPrefix         string                        `yaml:"session_prefix"`
+	NoiseSuppressionLevel string                        `yaml:"noise_suppression_level"`
+	TimeZone              string                        `yaml:"time_zone"`
+	UseToolFakes          bool                          `yaml:"use_tool_fakes"`
+	RestartOnGoAway       bool                          `yaml:"restart_on_goaway"`
+	Extensions            map[string]CESExtensionConfig `yaml:"extensions"`
+}
+
+type CESExtensionConfig struct {
+	ProjectID    string `yaml:"project_id"`
+	Location     string `yaml:"location"`
+	AppID        string `yaml:"app_id"`
+	DeploymentID string `yaml:"deployment_id"`
 }
 
 type CallLogConfig struct {
@@ -93,8 +99,6 @@ func Default() *Config {
 			PortMin:             10000,
 			PortMax:             20000,
 			SymmetricRTP:        true,
-			InputChunkMS:        40,
-			OutboundPacketMS:    20,
 			MediaTimeoutInitial: 30 * time.Second,
 			MediaTimeout:        15 * time.Second,
 		},
@@ -120,20 +124,8 @@ func (c *Config) Validate() error {
 	if c.RTP.PortMin <= 0 || c.RTP.PortMax < c.RTP.PortMin || c.RTP.PortMax > 65535 {
 		return fmt.Errorf("rtp port range is invalid")
 	}
-	if c.RTP.InputChunkMS <= 0 {
-		return fmt.Errorf("rtp.input_chunk_ms must be positive")
-	}
-	if c.RTP.OutboundPacketMS <= 0 {
-		return fmt.Errorf("rtp.outbound_packet_ms must be positive")
-	}
-	if c.CES.ProjectID == "" {
-		return fmt.Errorf("ces.project_id is required")
-	}
-	if c.CES.Location == "" {
-		return fmt.Errorf("ces.location is required")
-	}
-	if c.CES.AppID == "" {
-		return fmt.Errorf("ces.app_id is required")
+	if err := c.CES.Validate(); err != nil {
+		return err
 	}
 	switch c.CES.Transport {
 	case TransportGRPC, TransportWebSocket:
@@ -144,6 +136,63 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("call_log.pubsub_project_id is required when ces.project_id is empty")
 	}
 	return nil
+}
+
+func (c CESConfig) Validate() error {
+	if len(c.Extensions) == 0 {
+		return validateCESConfig(c, "ces")
+	}
+	for extension := range c.Extensions {
+		if extension == "" {
+			return fmt.Errorf("ces.extensions key must not be empty")
+		}
+		effective, ok := c.ForExtension(extension)
+		if !ok {
+			return fmt.Errorf("ces.extensions.%s is invalid", extension)
+		}
+		if err := validateCESConfig(effective, "ces.extensions."+extension); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCESConfig(c CESConfig, prefix string) error {
+	if c.ProjectID == "" {
+		return fmt.Errorf("%s.project_id is required", prefix)
+	}
+	if c.Location == "" {
+		return fmt.Errorf("%s.location is required", prefix)
+	}
+	if c.AppID == "" {
+		return fmt.Errorf("%s.app_id is required", prefix)
+	}
+	return nil
+}
+
+func (c CESConfig) ForExtension(extension string) (CESConfig, bool) {
+	if len(c.Extensions) == 0 {
+		c.Extensions = nil
+		return c, true
+	}
+	ext, ok := c.Extensions[extension]
+	if !ok {
+		return CESConfig{}, false
+	}
+	c.Extensions = nil
+	if ext.ProjectID != "" {
+		c.ProjectID = ext.ProjectID
+	}
+	if ext.Location != "" {
+		c.Location = ext.Location
+	}
+	if ext.AppID != "" {
+		c.AppID = ext.AppID
+	}
+	if ext.DeploymentID != "" {
+		c.DeploymentID = ext.DeploymentID
+	}
+	return c, true
 }
 
 func (c CESConfig) AppResource() string {

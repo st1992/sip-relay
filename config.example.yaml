@@ -1,7 +1,7 @@
 sip:
   listen_ip: 0.0.0.0
   listen_port: 5060
-  advertised_ip: 127.0.0.1
+  advertised_ip: 35.238.xx.xx
   user_agent: streamlink
 
 rtp:
@@ -9,27 +9,27 @@ rtp:
   port_min: 10000
   port_max: 20000
   symmetric_rtp: true
-  input_chunk_ms: 40
-  outbound_packet_ms: 20
   media_timeout_initial: 30s
   media_timeout: 15s
 
 ces:
-  project_id: your-project
+  project_id: div-deai-cx-dev-usc1-ri
   location: us
-  app_id: your-app
-  deployment_id: your-deployment
   endpoint: ces.googleapis.com:443
   transport: grpc
-  credentials_file: ""
+  credentials_file: "/home/sumeet1/sip-relay/credentials.json"
   session_prefix: sip
   noise_suppression_level: ""
   time_zone: ""
   use_tool_fakes: false
   restart_on_goaway: false
+  extensions:
+    "1014":
+      app_id: 203a8f7e-7415-4d05-ac80-95617b3ad39b
+      deployment_id: dea554e4-5eeb-4cd6-88e2-1b0bb27eb250
 
 call_log:
-  pubsub_project_id: ""
-  pubsub_topic_id: ""
+  pubsub_project_id: div-deai-cx-dev-usc1-ri
+  pubsub_topic_id: cx-gecx-topic
   recording_bucket: ""
 

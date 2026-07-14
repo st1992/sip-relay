@@ -6,9 +6,7 @@ FROM golang:1.25-alpine AS build
 WORKDIR /src
 
 ENV CGO_ENABLED=0 \
-    GOOS=linux \
-    GOFLAGS=-p=1 \
-    GOMAXPROCS=2
+    GOOS=linux
 
 # Cache module downloads separately from the source.
 COPY go.mod go.sum ./
@@ -40,9 +38,6 @@ WORKDIR /app
 
 COPY --from=build /out/sip-relay /usr/local/bin/sip-relay
 COPY config.example.yaml /app/config.yaml
-
-ENV GOMEMLIMIT=512MiB \
-    GOGC=75
 
 EXPOSE 5060/tcp
 EXPOSE 5060/udp

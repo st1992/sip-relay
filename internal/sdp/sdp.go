@@ -7,8 +7,11 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	pionsdp "github.com/pion/sdp/v3"
+
+	relayrtp "sip-relay/internal/rtp"
 )
 
 const (
@@ -28,6 +31,9 @@ type Answer struct {
 }
 
 func AnswerOffer(offerData []byte, advertisedIP netip.Addr, mediaPort int) (*Answer, error) {
+	// Keep SDP ptime aligned with the RTP frame duration, matching LiveKit SIP's fixed 20ms media frames.
+	var _ = [1]struct{}{}[20*time.Millisecond-relayrtp.FrameDuration]
+
 	var desc pionsdp.SessionDescription
 	if err := desc.Unmarshal(offerData); err != nil {
 		return nil, err
@@ -49,7 +55,7 @@ func AnswerOffer(offerData []byte, advertisedIP netip.Addr, mediaPort int) (*Ans
 			AddressType:    addressType(advertisedIP),
 			UnicastAddress: advertisedIP.String(),
 		},
-		SessionName: "sip-relay",
+		SessionName: "streamlink",
 		ConnectionInformation: &pionsdp.ConnectionInformation{
 			NetworkType: "IN",
 			AddressType: addressType(advertisedIP),
@@ -68,6 +74,7 @@ func AnswerOffer(offerData []byte, advertisedIP netip.Addr, mediaPort int) (*Ans
 				},
 				Attributes: []pionsdp.Attribute{
 					{Key: "rtpmap", Value: fmt.Sprintf("%d PCMU/8000", offer.PayloadType)},
+					{Key: "ptime", Value: strconv.Itoa(int(relayrtp.FrameDuration / time.Millisecond))},
 					{Key: "sendrecv"},
 				},
 			},

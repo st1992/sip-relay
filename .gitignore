@@ -1,0 +1,19 @@
+# Local configuration and credentials
+credentials.json
+config.yaml
+.env
+.env.*
+!.env.example
+
+# Go build and test artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
