@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-func TestRecordingObjectNameStoresUnderAppID(t *testing.T) {
-	got := RecordingObjectName("voice-app", "call/123@example.com")
-	want := "voice-app/call-123-example.com.ulaw"
+func TestRecordingObjectNameStoresUnderBackend(t *testing.T) {
+	got := RecordingObjectName("websocket", "call/123@example.com")
+	want := "websocket/call-123-example.com.ulaw"
 	if got != want {
 		t.Fatalf("RecordingObjectName() = %q, want %q", got, want)
 	}
@@ -26,10 +26,8 @@ func TestEntryJSONIncludesOnlyCallEventFields(t *testing.T) {
 	start := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 	end := start.Add(time.Minute)
 	data, err := json.Marshal(Entry{
-		ProjectID:      "project",
-		Location:       "us",
-		AppID:          "app",
-		DeploymentID:   "deployment",
+		Backend:        "ces",
+		Provider:       map[string]string{"app_id": "app"},
 		ConversationID: "session-1",
 		ANI:            "caller",
 		DNIS:           "1014",
@@ -46,10 +44,7 @@ func TestEntryJSONIncludesOnlyCallEventFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]any{
-		"project_id":      "project",
-		"location":        "us",
-		"app_id":          "app",
-		"deployment_id":   "deployment",
+		"backend":         "ces",
 		"conversation_id": "session-1",
 		"ani":             "caller",
 		"dnis":            "1014",
@@ -57,6 +52,11 @@ func TestEntryJSONIncludesOnlyCallEventFields(t *testing.T) {
 		"end_time":        "2026-07-07T12:01:00Z",
 		"hangup_reason":   "USER_ENDED",
 	}
+	provider, ok := got["provider"].(map[string]any)
+	if !ok || provider["app_id"] != "app" {
+		t.Fatalf("provider = %#v", got["provider"])
+	}
+	delete(got, "provider")
 	if len(got) != len(want) {
 		t.Fatalf("entry fields = %v, want exactly %v", got, want)
 	}

@@ -16,10 +16,13 @@ import (
 	"github.com/livekit/sipgo"
 	sipmsg "github.com/livekit/sipgo/sip"
 
+	"sip-relay/internal/backend"
 	"sip-relay/internal/call"
+	"sip-relay/internal/ces"
 	"sip-relay/internal/config"
 	relayrtp "sip-relay/internal/rtp"
 	relaysdp "sip-relay/internal/sdp"
+	telephonyws "sip-relay/internal/websocket"
 )
 
 const ackTimeout = 10 * time.Second
@@ -193,10 +196,15 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		respond(req, tx, 400, "Missing SDP", nil)
 		return
 	}
-	cesConfig, ok := s.cfg.CES.ForExtension(extension)
+	route, ok := s.cfg.Route(extension)
 	if !ok {
 		s.log.Warn("rejecting SIP INVITE for unconfigured extension", "call_id", callID, "extension", extension)
 		respond(req, tx, 404, "Unknown extension", nil)
+		return
+	}
+	mediaBackend, sessionPrefix, err := backendForRoute(s.cfg, route)
+	if err != nil {
+		respond(req, tx, 500, "Invalid extension backend", nil)
 		return
 	}
 
@@ -208,12 +216,14 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 
 	localTag := randomTag()
 	port, err := relayrtp.Listen(relayrtp.Config{
-		ListenIP:     s.cfg.RTP.ListenIP,
-		PortMin:      s.cfg.RTP.PortMin,
-		PortMax:      s.cfg.RTP.PortMax,
-		SymmetricRTP: s.cfg.RTP.SymmetricRTP,
-		PayloadType:  0,
-		Log:          s.log,
+		ListenIP:            s.cfg.RTP.ListenIP,
+		PortMin:             s.cfg.RTP.PortMin,
+		PortMax:             s.cfg.RTP.PortMax,
+		SymmetricRTP:        s.cfg.RTP.SymmetricRTP,
+		MediaTimeoutInitial: s.cfg.RTP.MediaTimeoutInitial,
+		MediaTimeout:        s.cfg.RTP.MediaTimeout,
+		PayloadType:         0,
+		Log:                 s.log,
 	})
 	if err != nil {
 		respond(req, tx, 503, "No RTP port available", nil)
@@ -239,16 +249,14 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		return
 	}
 
-	sessionID := sessionID(cesConfig.SessionPrefix, callID, localTag)
+	sessionID := sessionID(sessionPrefix, callID, localTag)
 	metadata := call.Metadata{
 		CallID:  callID,
 		ANI:     ani(req),
 		DNIS:    extension,
 		Headers: headers(req),
 	}
-	callConfig := *s.cfg
-	callConfig.CES = cesConfig
-	c := call.New(sessionID, metadata, &callConfig, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension))
+	c := call.New(sessionID, metadata, s.cfg, mediaBackend, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension, "backend", route.Backend))
 	e := &entry{
 		localTag: localTag,
 		callID:   callID,
@@ -275,7 +283,7 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 	go s.awaitACK(context.Background(), e, tx)
 	go func() {
 		<-c.Done()
-		if c.EndReason() == call.EndReasonCESEnded {
+		if shouldSendBYE(c.EndReason()) {
 			e.close.Do(func() {
 				s.sendBYE(e)
 				s.remove(e)
@@ -397,7 +405,7 @@ func (s *Server) sendBYE(e *entry) {
 		return
 	}
 
-	s.log.Info("sending SIP BYE after CES ended session", "call_id", e.callID)
+	s.log.Info("sending SIP BYE after backend ended call", "call_id", e.callID, "reason", e.call.EndReason())
 	tx, err := s.cli.TransactionRequest(req)
 	if err != nil {
 		s.log.Warn("failed to send SIP BYE", "call_id", e.callID, "error", err)
@@ -466,12 +474,36 @@ func newServerBYE(d *dialog) *sipmsg.Request {
 
 	req.SetBody(nil)
 	req.SetTransport(d.invite.Transport())
-	req.SetDestination(d.invite.Source())
+	if route := req.Route(); route != nil {
+		req.SetDestination(route.Address.HostPort())
+	} else {
+		req.SetDestination(recipient.HostPort())
+	}
 	return req
 }
 
 func (s *Server) contactHeader() string {
 	return fmt.Sprintf("<sip:%s@%s:%d>", s.cfg.SIP.UserAgent, s.cfg.SIP.AdvertisedIP, s.cfg.SIP.ListenPort)
+}
+
+func backendForRoute(cfg *config.Config, route config.ExtensionConfig) (backend.Dialer, string, error) {
+	switch route.Backend {
+	case config.BackendCES:
+		return ces.Dialer{Config: cfg.CES}, cfg.CES.SessionPrefix, nil
+	case config.BackendWebSocket:
+		return telephonyws.Dialer{Config: cfg.WebSocket}, "sip", nil
+	default:
+		return nil, "", fmt.Errorf("unsupported backend %q", route.Backend)
+	}
+}
+
+func shouldSendBYE(reason call.EndReason) bool {
+	switch reason {
+	case call.EndReasonAgent, call.EndReasonTransfer, call.EndReasonBackend:
+		return true
+	default:
+		return false
+	}
 }
 
 func callID(req *sipmsg.Request) string {

@@ -3,53 +3,21 @@ package ces
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
-	"os"
-	"strings"
 	"sync"
+	"time"
 
 	cesapi "cloud.google.com/go/ces/apiv1"
 	cespb "cloud.google.com/go/ces/apiv1/cespb"
-	"github.com/gorilla/websocket"
-	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/encoding/protojson"
 
+	"sip-relay/internal/backend"
 	"sip-relay/internal/config"
 )
 
-const cloudPlatformScope = "https://www.googleapis.com/auth/cloud-platform"
 const initialTextInput = "hello"
-
-type EventType int
-
-const (
-	EventAudio EventType = iota
-	EventText
-	EventRecognition
-	EventInterruption
-	EventTurnComplete
-	EventEndSession
-	EventGoAway
-)
-
-type Event struct {
-	Type  EventType
-	Audio []byte
-	Text  string
-}
-
-type Stream interface {
-	Input() chan<- []byte
-	Events() <-chan Event
-	Done() <-chan error
-	Close() error
-}
 
 type Options struct {
 	Config    config.CESConfig
@@ -57,18 +25,32 @@ type Options struct {
 	Log       *slog.Logger
 }
 
-func Dial(ctx context.Context, opts Options) (Stream, error) {
+type Dialer struct {
+	Config config.CESConfig
+}
+
+func (d Dialer) Dial(ctx context.Context, sessionID string, log *slog.Logger) (backend.Stream, error) {
+	return Dial(ctx, Options{Config: d.Config, SessionID: sessionID, Log: log})
+}
+
+func (d Dialer) Name() string { return config.BackendCES }
+
+func (d Dialer) Metadata() map[string]string {
+	return map[string]string{
+		"project_id":    d.Config.ProjectID,
+		"location":      d.Config.Location,
+		"app_id":        d.Config.AppID,
+		"deployment_id": d.Config.DeploymentID,
+	}
+}
+
+func (d Dialer) ConnectTimeout() time.Duration { return 15 * time.Second }
+
+func Dial(ctx context.Context, opts Options) (backend.Stream, error) {
 	if opts.Log == nil {
 		opts.Log = slog.Default()
 	}
-	switch opts.Config.Transport {
-	case config.TransportGRPC:
-		return dialGRPC(ctx, opts)
-	case config.TransportWebSocket:
-		return dialWebSocket(ctx, opts)
-	default:
-		return nil, fmt.Errorf("unsupported CES transport %q", opts.Config.Transport)
-	}
+	return dialGRPC(ctx, opts)
 }
 
 func ConfigMessage(conf config.CESConfig, sessionID string) *cespb.BidiSessionClientMessage {
@@ -116,7 +98,7 @@ func TextMessage(text string) *cespb.BidiSessionClientMessage {
 
 type baseStream struct {
 	input  chan []byte
-	events chan Event
+	events chan backend.Event
 	done   chan error
 	closed chan struct{}
 	cancel context.CancelFunc
@@ -126,7 +108,7 @@ type baseStream struct {
 func newBaseStream(cancel context.CancelFunc) baseStream {
 	return baseStream{
 		input:  make(chan []byte),
-		events: make(chan Event),
+		events: make(chan backend.Event, 32),
 		done:   make(chan error, 1),
 		closed: make(chan struct{}),
 		cancel: cancel,
@@ -137,7 +119,7 @@ func (s *baseStream) Input() chan<- []byte {
 	return s.input
 }
 
-func (s *baseStream) Events() <-chan Event {
+func (s *baseStream) Events() <-chan backend.Event {
 	return s.events
 }
 
@@ -150,12 +132,20 @@ func (s *baseStream) finish(err error) {
 		if err == context.Canceled {
 			err = nil
 		}
-		s.done <- err
-		close(s.done)
-		close(s.events)
 		close(s.closed)
 		s.cancel()
+		s.done <- err
+		close(s.done)
 	})
+}
+
+func (s *baseStream) emit(event backend.Event) bool {
+	select {
+	case s.events <- event:
+		return true
+	case <-s.closed:
+		return false
+	}
 }
 
 type grpcStream struct {
@@ -205,7 +195,7 @@ func dialGRPC(ctx context.Context, opts Options) (*grpcStream, error) {
 
 	out := &grpcStream{baseStream: newBaseStream(cancel), client: client}
 	go out.sendLoop(rpcStream)
-	go out.recvLoop(rpcStream, opts.Log)
+	go out.recvLoop(rpcStream)
 	return out, nil
 }
 
@@ -235,7 +225,7 @@ func (s *grpcStream) sendLoop(rpcStream cespb.SessionService_BidiRunSessionClien
 	}
 }
 
-func (s *grpcStream) recvLoop(rpcStream cespb.SessionService_BidiRunSessionClient, log *slog.Logger) {
+func (s *grpcStream) recvLoop(rpcStream cespb.SessionService_BidiRunSessionClient) {
 	for {
 		msg, err := rpcStream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -246,187 +236,62 @@ func (s *grpcStream) recvLoop(rpcStream cespb.SessionService_BidiRunSessionClien
 			s.finish(err)
 			return
 		}
-		if stop := emitServerMessage(msg, s.events, log); stop {
+		if terminalErr := emitServerMessage(msg, s.emit); terminalErr != nil {
 			_ = rpcStream.CloseSend()
-			s.finish(nil)
+			s.finish(terminalErr)
 			return
 		}
 	}
 }
 
-type wsStream struct {
-	baseStream
-	conn *websocket.Conn
-	mu   sync.Mutex
-}
-
-func dialWebSocket(ctx context.Context, opts Options) (*wsStream, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	opts.Log.Info("creating CES WebSocket token source", "endpoint", opts.Config.Endpoint, "location", opts.Config.Location)
-	tokenSource, err := tokenSource(ctx, opts.Config)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	token, err := tokenSource.Token()
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	header := http.Header{}
-	header.Set("Authorization", "Bearer "+token.AccessToken)
-	header.Set("x-goog-request-params", "location=locations/"+opts.Config.Location)
-	opts.Log.Info("opening CES WebSocket", "url", websocketURL(opts.Config))
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, websocketURL(opts.Config), header)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	out := &wsStream{baseStream: newBaseStream(cancel), conn: conn}
-	opts.Log.Info("sending CES WebSocket session config")
-	if err := out.writeProto(ConfigMessage(opts.Config, opts.SessionID)); err != nil {
-		_ = conn.Close()
-		cancel()
-		return nil, err
-	}
-	opts.Log.Info("CES WebSocket session config sent")
-	opts.Log.Info("sending initial CES WebSocket text input", "text", initialTextInput)
-	if err := out.writeProto(TextMessage(initialTextInput)); err != nil {
-		_ = conn.Close()
-		cancel()
-		return nil, err
-	}
-	opts.Log.Info("initial CES WebSocket text input sent")
-	go out.sendLoop()
-	go out.recvLoop(opts.Log)
-	return out, nil
-}
-
-func (s *wsStream) Close() error {
-	s.cancel()
-	if s.conn != nil {
-		return s.conn.Close()
-	}
-	return nil
-}
-
-func (s *wsStream) sendLoop() {
-	for {
-		select {
-		case <-s.closed:
-			return
-		case payload, ok := <-s.input:
-			if !ok {
-				return
-			}
-			if err := s.writeProto(AudioMessage(payload)); err != nil {
-				s.finish(err)
-				return
-			}
-		}
-	}
-}
-
-func (s *wsStream) recvLoop(log *slog.Logger) {
-	for {
-		_, data, err := s.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				s.finish(nil)
-			} else {
-				s.finish(err)
-			}
-			return
-		}
-		var msg cespb.BidiSessionServerMessage
-		if err := protojson.Unmarshal(data, &msg); err != nil {
-			log.Debug("dropping malformed CES WebSocket message", "error", err)
-			continue
-		}
-		if stop := emitServerMessage(&msg, s.events, log); stop {
-			s.finish(nil)
-			return
-		}
-	}
-}
-
-func (s *wsStream) writeProto(msg *cespb.BidiSessionClientMessage) error {
-	data, err := protojson.MarshalOptions{UseProtoNames: false}.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.conn.WriteMessage(websocket.TextMessage, data)
-}
-
-func emitServerMessage(msg *cespb.BidiSessionServerMessage, events chan<- Event, log *slog.Logger) bool {
+func emitServerMessage(msg *cespb.BidiSessionServerMessage, emit func(backend.Event) bool) error {
 	if out := msg.GetSessionOutput(); out != nil {
 		if audio := out.GetAudio(); len(audio) > 0 {
-			events <- Event{Type: EventAudio, Audio: append([]byte(nil), audio...)}
+			if !emit(backend.Event{Type: backend.EventAudio, Audio: append([]byte(nil), audio...)}) {
+				return context.Canceled
+			}
 		}
 		if text := out.GetText(); text != "" {
-			events <- Event{Type: EventText, Text: text}
+			if !emit(backend.Event{Type: backend.EventBotTranscript, Text: text}) {
+				return context.Canceled
+			}
 		}
 		if out.GetTurnCompleted() {
-			events <- Event{Type: EventTurnComplete}
+			if !emit(backend.Event{Type: backend.EventTurnComplete}) {
+				return context.Canceled
+			}
 		}
 		if out.GetEndSession() != nil {
-			events <- Event{Type: EventEndSession}
-			return true
+			if !emit(backend.Event{Type: backend.EventEndSession}) {
+				return context.Canceled
+			}
+			return backend.ErrAgentEnded
 		}
-		return false
+		return nil
 	}
 	if rec := msg.GetRecognitionResult(); rec != nil {
-		events <- Event{Type: EventRecognition}
-		return false
+		if !emit(backend.Event{Type: backend.EventUserTranscript}) {
+			return context.Canceled
+		}
+		return nil
 	}
 	if msg.GetInterruptionSignal() != nil {
-		events <- Event{Type: EventInterruption}
-		return false
+		if !emit(backend.Event{Type: backend.EventBargeIn}) {
+			return context.Canceled
+		}
+		return nil
 	}
 	if msg.GetEndSession() != nil {
-		events <- Event{Type: EventEndSession}
-		return true
+		if !emit(backend.Event{Type: backend.EventEndSession}) {
+			return context.Canceled
+		}
+		return backend.ErrAgentEnded
 	}
 	if msg.GetGoAway() != nil {
-		events <- Event{Type: EventGoAway}
-		return true
-	}
-	return false
-}
-
-func tokenSource(ctx context.Context, conf config.CESConfig) (oauth2.TokenSource, error) {
-	if conf.CredentialsFile != "" {
-		data, err := os.ReadFile(conf.CredentialsFile)
-		if err != nil {
-			return nil, err
+		if !emit(backend.Event{Type: backend.EventGoAway}) {
+			return context.Canceled
 		}
-		creds, err := google.CredentialsFromJSON(ctx, data, cloudPlatformScope)
-		if err != nil {
-			return nil, err
-		}
-		return creds.TokenSource, nil
+		return backend.ErrGoAway
 	}
-	creds, err := google.FindDefaultCredentials(ctx, cloudPlatformScope)
-	if err != nil {
-		return nil, err
-	}
-	return creds.TokenSource, nil
-}
-
-func websocketURL(conf config.CESConfig) string {
-	if strings.HasPrefix(conf.Endpoint, "ws://") || strings.HasPrefix(conf.Endpoint, "wss://") {
-		return conf.Endpoint
-	}
-	host := conf.Endpoint
-	if host == "" {
-		host = "ces.googleapis.com"
-	}
-	host = strings.TrimPrefix(host, "https://")
-	host = strings.TrimPrefix(host, "http://")
-	host = strings.TrimSuffix(host, ":443")
-	return fmt.Sprintf("wss://%s/ws/google.cloud.ces.v1.SessionService/BidiRunSession/locations/%s", host, conf.Location)
+	return nil
 }

@@ -1,9 +1,11 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"time"
 
@@ -11,15 +13,17 @@ import (
 )
 
 const (
-	TransportGRPC      = "grpc"
-	TransportWebSocket = "websocket"
+	BackendCES       = "ces"
+	BackendWebSocket = "websocket"
 )
 
 type Config struct {
-	SIP     SIPConfig     `yaml:"sip"`
-	RTP     RTPConfig     `yaml:"rtp"`
-	CES     CESConfig     `yaml:"ces"`
-	CallLog CallLogConfig `yaml:"call_log"`
+	SIP        SIPConfig                  `yaml:"sip"`
+	RTP        RTPConfig                  `yaml:"rtp"`
+	CES        CESConfig                  `yaml:"ces"`
+	WebSocket  WebSocketConfig            `yaml:"websocket"`
+	Extensions map[string]ExtensionConfig `yaml:"extensions"`
+	CallLog    CallLogConfig              `yaml:"call_log"`
 }
 
 type SIPConfig struct {
@@ -39,32 +43,34 @@ type RTPConfig struct {
 }
 
 type CESConfig struct {
-	ProjectID             string                        `yaml:"project_id"`
-	Location              string                        `yaml:"location"`
-	AppID                 string                        `yaml:"app_id"`
-	DeploymentID          string                        `yaml:"deployment_id"`
-	Endpoint              string                        `yaml:"endpoint"`
-	Transport             string                        `yaml:"transport"`
-	CredentialsFile       string                        `yaml:"credentials_file"`
-	SessionPrefix         string                        `yaml:"session_prefix"`
-	NoiseSuppressionLevel string                        `yaml:"noise_suppression_level"`
-	TimeZone              string                        `yaml:"time_zone"`
-	UseToolFakes          bool                          `yaml:"use_tool_fakes"`
-	RestartOnGoAway       bool                          `yaml:"restart_on_goaway"`
-	Extensions            map[string]CESExtensionConfig `yaml:"extensions"`
+	ProjectID             string `yaml:"project_id"`
+	Location              string `yaml:"location"`
+	AppID                 string `yaml:"app_id"`
+	DeploymentID          string `yaml:"deployment_id"`
+	Endpoint              string `yaml:"endpoint"`
+	CredentialsFile       string `yaml:"credentials_file"`
+	SessionPrefix         string `yaml:"session_prefix"`
+	NoiseSuppressionLevel string `yaml:"noise_suppression_level"`
+	TimeZone              string `yaml:"time_zone"`
+	UseToolFakes          bool   `yaml:"use_tool_fakes"`
 }
 
-type CESExtensionConfig struct {
-	ProjectID    string `yaml:"project_id"`
-	Location     string `yaml:"location"`
-	AppID        string `yaml:"app_id"`
-	DeploymentID string `yaml:"deployment_id"`
+type WebSocketConfig struct {
+	BaseURL         string        `yaml:"base_url"`
+	SessionTimeout  time.Duration `yaml:"session_timeout"`
+	ConnectTimeout  time.Duration `yaml:"connect_timeout"`
+	MaxMessageBytes int64         `yaml:"max_message_bytes"`
+}
+
+type ExtensionConfig struct {
+	Backend string `yaml:"backend"`
 }
 
 type CallLogConfig struct {
 	PubSubProjectID string `yaml:"pubsub_project_id"`
 	PubSubTopicID   string `yaml:"pubsub_topic_id"`
 	RecordingBucket string `yaml:"recording_bucket"`
+	CredentialsFile string `yaml:"credentials_file"`
 }
 
 func Load(path string) (*Config, error) {
@@ -77,7 +83,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	cfg := Default()
-	if err := yaml.Unmarshal(data, cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(cfg); err != nil {
 		return nil, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -105,8 +113,12 @@ func Default() *Config {
 		CES: CESConfig{
 			Location:      "us",
 			Endpoint:      "ces.googleapis.com:443",
-			Transport:     TransportGRPC,
 			SessionPrefix: "sip",
+		},
+		WebSocket: WebSocketConfig{
+			SessionTimeout:  15 * time.Second,
+			ConnectTimeout:  15 * time.Second,
+			MaxMessageBytes: 4 << 20,
 		},
 	}
 }
@@ -124,75 +136,78 @@ func (c *Config) Validate() error {
 	if c.RTP.PortMin <= 0 || c.RTP.PortMax < c.RTP.PortMin || c.RTP.PortMax > 65535 {
 		return fmt.Errorf("rtp port range is invalid")
 	}
-	if err := c.CES.Validate(); err != nil {
-		return err
+	if c.RTP.MediaTimeoutInitial <= 0 || c.RTP.MediaTimeout <= 0 {
+		return fmt.Errorf("rtp media timeouts must be positive")
 	}
-	switch c.CES.Transport {
-	case TransportGRPC, TransportWebSocket:
-	default:
-		return fmt.Errorf("ces.transport must be %q or %q", TransportGRPC, TransportWebSocket)
+	if len(c.Extensions) == 0 {
+		return fmt.Errorf("extensions must configure at least one extension")
 	}
-	if c.CallLog.PubSubTopicID != "" && c.CallLog.PubSubProjectID == "" && c.CES.ProjectID == "" {
-		return fmt.Errorf("call_log.pubsub_project_id is required when ces.project_id is empty")
+	usesCES, usesWebSocket := false, false
+	for extension, route := range c.Extensions {
+		if extension == "" {
+			return fmt.Errorf("extensions key must not be empty")
+		}
+		switch route.Backend {
+		case BackendCES:
+			usesCES = true
+		case BackendWebSocket:
+			usesWebSocket = true
+		default:
+			return fmt.Errorf("extensions.%s.backend must be %q or %q", extension, BackendCES, BackendWebSocket)
+		}
+	}
+	if usesCES {
+		if err := c.CES.Validate(); err != nil {
+			return err
+		}
+	}
+	if usesWebSocket {
+		if err := c.WebSocket.Validate(); err != nil {
+			return err
+		}
+	}
+	if c.CallLog.PubSubTopicID != "" && c.CallLog.PubSubProjectID == "" {
+		return fmt.Errorf("call_log.pubsub_project_id is required when pubsub_topic_id is set")
 	}
 	return nil
 }
 
 func (c CESConfig) Validate() error {
-	if len(c.Extensions) == 0 {
-		return validateCESConfig(c, "ces")
-	}
-	for extension := range c.Extensions {
-		if extension == "" {
-			return fmt.Errorf("ces.extensions key must not be empty")
-		}
-		effective, ok := c.ForExtension(extension)
-		if !ok {
-			return fmt.Errorf("ces.extensions.%s is invalid", extension)
-		}
-		if err := validateCESConfig(effective, "ces.extensions."+extension); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func validateCESConfig(c CESConfig, prefix string) error {
 	if c.ProjectID == "" {
-		return fmt.Errorf("%s.project_id is required", prefix)
+		return fmt.Errorf("ces.project_id is required")
 	}
 	if c.Location == "" {
-		return fmt.Errorf("%s.location is required", prefix)
+		return fmt.Errorf("ces.location is required")
 	}
 	if c.AppID == "" {
-		return fmt.Errorf("%s.app_id is required", prefix)
+		return fmt.Errorf("ces.app_id is required")
 	}
 	return nil
 }
 
-func (c CESConfig) ForExtension(extension string) (CESConfig, bool) {
-	if len(c.Extensions) == 0 {
-		c.Extensions = nil
-		return c, true
+func (c WebSocketConfig) Validate() error {
+	u, err := url.Parse(c.BaseURL)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return fmt.Errorf("websocket.base_url must be an absolute http or https URL")
 	}
-	ext, ok := c.Extensions[extension]
-	if !ok {
-		return CESConfig{}, false
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("websocket.base_url must not contain a query or fragment")
 	}
-	c.Extensions = nil
-	if ext.ProjectID != "" {
-		c.ProjectID = ext.ProjectID
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("websocket.base_url must not contain a path")
 	}
-	if ext.Location != "" {
-		c.Location = ext.Location
+	if c.SessionTimeout <= 0 || c.ConnectTimeout <= 0 {
+		return fmt.Errorf("websocket timeouts must be positive")
 	}
-	if ext.AppID != "" {
-		c.AppID = ext.AppID
+	if c.MaxMessageBytes <= 0 {
+		return fmt.Errorf("websocket.max_message_bytes must be positive")
 	}
-	if ext.DeploymentID != "" {
-		c.DeploymentID = ext.DeploymentID
-	}
-	return c, true
+	return nil
+}
+
+func (c *Config) Route(extension string) (ExtensionConfig, bool) {
+	route, ok := c.Extensions[extension]
+	return route, ok
 }
 
 func (c CESConfig) AppResource() string {

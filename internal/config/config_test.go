@@ -1,79 +1,86 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
-func TestCESConfigForExtensionUsesConfiguredApp(t *testing.T) {
-	cfg := CESConfig{
-		ProjectID:     "project",
-		Location:      "us",
-		Endpoint:      "ces.googleapis.com:443",
-		Transport:     TransportGRPC,
-		SessionPrefix: "sip",
-		Extensions: map[string]CESExtensionConfig{
-			"1111": {
-				AppID:        "app-1111",
-				DeploymentID: "deployment-1111",
-			},
-		},
+func TestRouteSelectsConfiguredBackend(t *testing.T) {
+	cfg := Default()
+	cfg.Extensions = map[string]ExtensionConfig{
+		"1111": {Backend: BackendCES},
+		"2222": {Backend: BackendWebSocket},
 	}
 
-	got, ok := cfg.ForExtension("1111")
-	if !ok {
-		t.Fatal("extension 1111 was not accepted")
+	got, ok := cfg.Route("2222")
+	if !ok || got.Backend != BackendWebSocket {
+		t.Fatalf("Route(2222) = %#v, %v", got, ok)
 	}
-	if got.ProjectID != "project" {
-		t.Fatalf("project_id = %q, want project", got.ProjectID)
-	}
-	if got.Location != "us" {
-		t.Fatalf("location = %q, want us", got.Location)
-	}
-	if got.AppID != "app-1111" {
-		t.Fatalf("app_id = %q, want app-1111", got.AppID)
-	}
-	if got.DeploymentID != "deployment-1111" {
-		t.Fatalf("deployment_id = %q, want deployment-1111", got.DeploymentID)
-	}
-	if len(got.Extensions) != 0 {
-		t.Fatalf("resolved config kept extension map: %#v", got.Extensions)
-	}
-}
-
-func TestCESConfigForExtensionRejectsUnknownExtension(t *testing.T) {
-	cfg := CESConfig{
-		ProjectID: "project",
-		Location:  "us",
-		Extensions: map[string]CESExtensionConfig{
-			"1111": {AppID: "app-1111"},
-		},
-	}
-
-	if _, ok := cfg.ForExtension("2222"); ok {
+	if _, ok := cfg.Route("3333"); ok {
 		t.Fatal("unknown extension was accepted")
 	}
 }
 
-func TestCESConfigValidateAllowsExtensionMappedApps(t *testing.T) {
-	cfg := CESConfig{
-		ProjectID: "project",
-		Location:  "us",
-		Extensions: map[string]CESExtensionConfig{
-			"1111": {AppID: "app-1111"},
-		},
-	}
+func TestValidateOnlyRequiresSelectedBackendConfig(t *testing.T) {
+	cfg := Default()
+	cfg.Extensions = map[string]ExtensionConfig{"1111": {Backend: BackendWebSocket}}
+	cfg.WebSocket.BaseURL = "http://localhost:8001"
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestCESConfigValidateKeepsSingleAppConfigValid(t *testing.T) {
-	cfg := CESConfig{
-		ProjectID: "project",
-		Location:  "us",
-		AppID:     "app",
+func TestValidateRequiresCESConfigWhenSelected(t *testing.T) {
+	cfg := Default()
+	cfg.Extensions = map[string]ExtensionConfig{"1111": {Backend: BackendCES}}
+
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "ces.project_id") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestValidateRejectsUnknownBackend(t *testing.T) {
+	cfg := Default()
+	cfg.Extensions = map[string]ExtensionConfig{"1111": {Backend: "other"}}
+
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "extensions.1111.backend") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestWebSocketConfigRejectsBaseURLPath(t *testing.T) {
+	cfg := Default()
+	cfg.Extensions = map[string]ExtensionConfig{"1111": {Backend: BackendWebSocket}}
+	cfg.WebSocket.BaseURL = "http://localhost:8001/prefix"
+
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must not contain a path") {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestLoadRejectsRemovedCESTransport(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	data := []byte(`
+sip:
+  advertised_ip: 127.0.0.1
+rtp:
+  listen_ip: 0.0.0.0
+ces:
+  transport: websocket
+extensions:
+  "1111":
+    backend: websocket
+websocket:
+  base_url: http://localhost:8001
+`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
 	}
 
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "field transport not found") {
+		t.Fatalf("Load() error = %v", err)
 	}
 }

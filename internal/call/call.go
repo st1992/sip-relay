@@ -3,19 +3,19 @@ package call
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"sip-relay/internal/backend"
 	"sip-relay/internal/calllog"
-	"sip-relay/internal/ces"
 	"sip-relay/internal/config"
 	relayrtp "sip-relay/internal/rtp"
 )
 
 const (
-	cesConnectTimeout   = 15 * time.Second
 	finalizationTimeout = 2 * time.Minute
 	pcmuSilenceByte     = 0xff
 )
@@ -32,7 +32,9 @@ type EndReason string
 const (
 	EndReasonNone     EndReason = ""
 	EndReasonUser     EndReason = "user_ended"
-	EndReasonCESEnded EndReason = "ces_ended"
+	EndReasonAgent    EndReason = "agent_ended"
+	EndReasonTransfer EndReason = "transfer"
+	EndReasonBackend  EndReason = "backend_error"
 )
 
 type Call struct {
@@ -40,6 +42,7 @@ type Call struct {
 	Metadata Metadata
 	RTP      *relayrtp.Port
 	Config   *config.Config
+	Backend  backend.Dialer
 	Log      *slog.Logger
 	done     chan struct{}
 	mu       sync.Mutex
@@ -50,7 +53,7 @@ type Call struct {
 	doneOnce sync.Once
 }
 
-func New(id string, metadata Metadata, cfg *config.Config, port *relayrtp.Port, log *slog.Logger) *Call {
+func New(id string, metadata Metadata, cfg *config.Config, dialer backend.Dialer, port *relayrtp.Port, log *slog.Logger) *Call {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -59,6 +62,7 @@ func New(id string, metadata Metadata, cfg *config.Config, port *relayrtp.Port, 
 		Metadata: metadata,
 		RTP:      port,
 		Config:   cfg,
+		Backend:  dialer,
 		Log:      log,
 		done:     make(chan struct{}),
 	}
@@ -109,32 +113,36 @@ func (c *Call) CloseWithReason(reason EndReason) {
 	if cancel != nil {
 		cancel()
 	}
-	_ = c.RTP.Close()
+	if c.RTP != nil {
+		_ = c.RTP.Close()
+	}
 	if !started {
 		c.finishDone()
 	}
 }
 
 func (c *Call) run(ctx context.Context) {
-	defer c.finishDone()
-	defer c.Close()
-
 	startedAt := time.Now().UTC()
 	recorder, err := calllog.NewRecorder(c.Config.CallLog.RecordingBucket != "")
 	if err != nil {
 		c.Log.Error("failed to create call recorder", "error", err)
 	}
+	// Register finalization first so media teardown and Done notification happen
+	// before potentially slow storage or Pub/Sub operations.
 	defer c.finish(startedAt, recorder)
+	defer c.finishDone()
+	defer c.Close()
 
-	c.Log.Info("opening CES stream")
-	stream, cancelCES, err := c.dialCES(ctx)
+	c.Log.Info("opening media backend", "backend", c.Backend.Name())
+	stream, cancelBackend, err := c.dialBackend(ctx)
 	if err != nil {
-		c.Log.Error("failed to open CES stream", "error", err)
+		c.setEndReason(EndReasonBackend)
+		c.Log.Error("failed to open media backend", "backend", c.Backend.Name(), "error", err)
 		return
 	}
-	defer cancelCES()
+	defer cancelBackend()
 	defer stream.Close()
-	c.Log.Info("CES stream opened")
+	c.Log.Info("media backend opened", "backend", c.Backend.Name())
 
 	rtpErr := make(chan error, 1)
 	go func() {
@@ -153,10 +161,10 @@ func (c *Call) run(ctx context.Context) {
 	stats := &mediaStats{}
 	mediaErr := make(chan error, 2)
 	go func() {
-		mediaErr <- c.sendRTPToCES(mediaCtx, stream, recorder, stats)
+		mediaErr <- c.sendRTPToBackend(mediaCtx, stream, recorder, stats)
 	}()
 	go func() {
-		mediaErr <- c.receiveCES(mediaCtx, stream, recorder, stats)
+		mediaErr <- c.receiveBackend(mediaCtx, stream, recorder, stats)
 	}()
 
 	defer func() {
@@ -165,11 +173,11 @@ func (c *Call) run(ctx context.Context) {
 			"call media summary",
 			"inbound_rtp_packets", snapshot.inboundPackets,
 			"inbound_rtp_bytes", snapshot.inboundBytes,
-			"ces_chunks_sent", snapshot.cesChunksSent,
-			"ces_bytes_sent", snapshot.cesBytesSent,
-			"ces_silence_chunks_sent", snapshot.silenceChunksSent,
-			"ces_audio_events", snapshot.cesAudioEvents,
-			"ces_audio_bytes", snapshot.cesAudioBytes,
+			"backend_chunks_sent", snapshot.cesChunksSent,
+			"backend_bytes_sent", snapshot.cesBytesSent,
+			"backend_silence_chunks_sent", snapshot.silenceChunksSent,
+			"backend_audio_events", snapshot.cesAudioEvents,
+			"backend_audio_bytes", snapshot.cesAudioBytes,
 		)
 	}()
 
@@ -183,20 +191,33 @@ func (c *Call) run(ctx context.Context) {
 			}
 			return
 		case err := <-stream.Done():
-			if err != nil {
-				c.Log.Warn("CES stream ended", "error", err)
+			switch {
+			case errors.Is(err, backend.ErrAgentEnded):
+				c.setEndReason(EndReasonAgent)
+			case errors.Is(err, backend.ErrTransfer):
+				c.setEndReason(EndReasonTransfer)
+			case errors.Is(err, backend.ErrGoAway):
+				c.setEndReason(EndReasonBackend)
+			case err != nil:
+				c.Log.Warn("media backend stream ended", "backend", c.Backend.Name(), "error", err)
+			}
+			if ctx.Err() == nil && c.EndReason() == EndReasonNone {
+				c.setEndReason(EndReasonBackend)
 			}
 			return
 		case err := <-mediaErr:
 			if err != nil {
 				c.Log.Warn("media relay ended", "error", err)
+				if ctx.Err() == nil && c.EndReason() == EndReasonNone {
+					c.setEndReason(EndReasonBackend)
+				}
 			}
 			return
 		}
 	}
 }
 
-func (c *Call) sendRTPToCES(ctx context.Context, stream ces.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
+func (c *Call) sendRTPToBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
 	silence := make([]byte, relayrtp.SamplesPerFrame)
 	for i := range silence {
 		silence[i] = pcmuSilenceByte
@@ -225,7 +246,7 @@ func (c *Call) sendRTPToCES(ctx context.Context, stream ces.Stream, recorder *ca
 			if err := recorder.Write(payload); err != nil {
 				c.Log.Warn("failed to write inbound call recording", "error", err)
 			}
-			if !c.sendCESAudio(ctx, stream, payload, stats, false) {
+			if !c.sendBackendAudio(ctx, stream, payload, stats) {
 				return nil
 			}
 			nextSilenceAt = time.Now().Add(audioDuration(len(payload)))
@@ -234,9 +255,9 @@ func (c *Call) sendRTPToCES(ctx context.Context, stream ces.Stream, recorder *ca
 				continue
 			}
 			if stats.silenceChunksSent.Add(1) == 1 {
-				c.Log.Info("padding CES input with PCMU silence", "bytes", len(silence))
+				c.Log.Info("padding backend input with PCMU silence", "bytes", len(silence))
 			}
-			if !c.sendCESAudio(ctx, stream, silence, stats, true) {
+			if !c.sendBackendAudio(ctx, stream, silence, stats) {
 				return nil
 			}
 			nextSilenceAt = now.Add(relayrtp.FrameDuration)
@@ -244,13 +265,13 @@ func (c *Call) sendRTPToCES(ctx context.Context, stream ces.Stream, recorder *ca
 	}
 }
 
-func (c *Call) sendCESAudio(ctx context.Context, stream ces.Stream, payload []byte, stats *mediaStats, silence bool) bool {
+func (c *Call) sendBackendAudio(ctx context.Context, stream backend.Stream, payload []byte, stats *mediaStats) bool {
 	select {
 	case stream.Input() <- payload:
 		stats.cesChunksSent.Add(1)
 		stats.cesBytesSent.Add(uint64(len(payload)))
 		if stats.cesChunksSent.Load() == 1 {
-			c.Log.Info("sent first audio chunk to CES", "bytes", len(payload))
+			c.Log.Info("sent first audio chunk to backend", "backend", c.Backend.Name(), "bytes", len(payload))
 		}
 		return true
 	case <-ctx.Done():
@@ -297,7 +318,7 @@ func (s *mediaStats) snapshot() mediaStatsSnapshot {
 	}
 }
 
-func (c *Call) receiveCES(ctx context.Context, stream ces.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
+func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
 	outboundRTP := newOutboundRTPWriter(ctx, c.RTP, c.Log)
 	for {
 		select {
@@ -305,10 +326,10 @@ func (c *Call) receiveCES(ctx context.Context, stream ces.Stream, recorder *call
 			return nil
 		case event, ok := <-stream.Events():
 			if !ok {
-				return nil
+				return errors.New("backend events channel closed unexpectedly")
 			}
 			switch event.Type {
-			case ces.EventAudio:
+			case backend.EventAudio:
 				stats.cesAudioEvents.Add(1)
 				stats.cesAudioBytes.Add(uint64(len(event.Audio)))
 				if err := recorder.Write(event.Audio); err != nil {
@@ -317,23 +338,29 @@ func (c *Call) receiveCES(ctx context.Context, stream ces.Stream, recorder *call
 				if !outboundRTP.Enqueue(event.Audio) {
 					return nil
 				}
-			case ces.EventText:
-				c.Log.Info("received CES text output", "text", event.Text)
-			case ces.EventInterruption:
-				c.Log.Info("CES interruption signal received")
+			case backend.EventBotTranscript:
+				c.Log.Info("received bot transcript", "text", event.Text)
+			case backend.EventUserTranscript:
+				c.Log.Info("received user transcript", "text", event.Text)
+			case backend.EventBargeIn:
+				c.Log.Info("barge-in signal received")
 				if !outboundRTP.Interrupt() {
 					return nil
 				}
-			case ces.EventTurnComplete:
-				c.Log.Info("CES turn completed")
-			case ces.EventRecognition:
-				c.Log.Info("CES recognition result received")
-			case ces.EventEndSession:
-				c.Log.Info("CES ended session")
-				c.setEndReason(EndReasonCESEnded)
+			case backend.EventTurnComplete:
+				c.Log.Info("bot turn completed")
+			case backend.EventEndSession:
+				c.Log.Info("backend ended session")
+				c.setEndReason(EndReasonAgent)
 				return nil
-			case ces.EventGoAway:
-				c.Log.Info("CES sent go-away")
+			case backend.EventTransfer:
+				c.Log.Info("backend requested transfer")
+				_ = outboundRTP.Interrupt()
+				c.setEndReason(EndReasonTransfer)
+				return nil
+			case backend.EventGoAway:
+				c.Log.Info("backend sent go-away")
+				c.setEndReason(EndReasonBackend)
 				return nil
 			}
 		}
@@ -462,15 +489,14 @@ func (c *Call) finishDone() {
 	})
 }
 
-func (c *Call) dialCES(ctx context.Context) (ces.Stream, context.CancelFunc, error) {
+func (c *Call) dialBackend(ctx context.Context) (backend.Stream, context.CancelFunc, error) {
+	if c.Backend == nil {
+		return nil, nil, errors.New("media backend is not configured")
+	}
 	dialCtx, cancel := context.WithCancel(ctx)
 	results := make(chan dialResult, 1)
 	go func() {
-		stream, err := ces.Dial(dialCtx, ces.Options{
-			Config:    c.Config.CES,
-			SessionID: c.ID,
-			Log:       c.Log,
-		})
+		stream, err := c.Backend.Dial(dialCtx, c.ID, c.Log)
 		if dialCtx.Err() != nil {
 			if stream != nil {
 				_ = stream.Close()
@@ -481,7 +507,7 @@ func (c *Call) dialCES(ctx context.Context) (ces.Stream, context.CancelFunc, err
 		results <- result
 	}()
 
-	timer := time.NewTimer(cesConnectTimeout)
+	timer := time.NewTimer(c.Backend.ConnectTimeout())
 	defer timer.Stop()
 
 	select {
@@ -493,7 +519,7 @@ func (c *Call) dialCES(ctx context.Context) (ces.Stream, context.CancelFunc, err
 		return result.stream, cancel, nil
 	case <-timer.C:
 		cancel()
-		return nil, nil, errors.New("timed out opening CES stream")
+		return nil, nil, fmt.Errorf("timed out opening %s backend", c.Backend.Name())
 	case <-ctx.Done():
 		cancel()
 		return nil, nil, ctx.Err()
@@ -501,7 +527,7 @@ func (c *Call) dialCES(ctx context.Context) (ces.Stream, context.CancelFunc, err
 }
 
 type dialResult struct {
-	stream ces.Stream
+	stream backend.Stream
 	err    error
 }
 
@@ -510,7 +536,7 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 	ctx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 	defer cancel()
 	if recorder != nil {
-		if uri, err := recorder.Upload(ctx, c.Config, c.logCallID()); err != nil {
+		if uri, err := recorder.Upload(ctx, c.Config, c.Backend.Name(), c.logCallID()); err != nil {
 			c.Log.Error("failed to upload call recording", "error", err)
 		} else if uri != "" {
 			c.Log.Info("uploaded call recording", "uri", uri)
@@ -520,10 +546,8 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 		}
 	}
 	if err := calllog.Publish(ctx, c.Config, calllog.Entry{
-		ProjectID:      c.Config.CES.ProjectID,
-		Location:       c.Config.CES.Location,
-		AppID:          c.Config.CES.AppID,
-		DeploymentID:   c.Config.CES.DeploymentID,
+		Backend:        c.Backend.Name(),
+		Provider:       c.Backend.Metadata(),
 		ConversationID: c.ID,
 		ANI:            c.Metadata.ANI,
 		DNIS:           c.Metadata.DNIS,
@@ -537,8 +561,12 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 
 func (c *Call) hangupReason() string {
 	switch c.EndReason() {
-	case EndReasonCESEnded:
+	case EndReasonAgent:
 		return "AGENT_ENDED"
+	case EndReasonTransfer:
+		return "TRANSFERRED"
+	case EndReasonBackend:
+		return "BACKEND_ERROR"
 	default:
 		return "USER_ENDED"
 	}

@@ -1,6 +1,6 @@
 # SIP Relay
 
-`sip-relay` is a separate Go module that accepts inbound SIP calls, negotiates only PCMU/G.711 mu-law at 8000 Hz, forwards RTP payload bytes to Google CES `BidiRunSession`, and wraps CES output bytes back into RTP packets.
+`sip-relay` accepts inbound SIP calls, negotiates PCMU/G.711 mu-law at 8000 Hz, and routes each extension to either Google CES over gRPC or an independent telephony WebSocket service.
 
 The media path intentionally does not decode, resample, mix, or transcode audio. It only parses RTP headers so it can extract and write packet payloads.
 
@@ -10,7 +10,30 @@ The media path intentionally does not decode, resample, mix, or transcode audio.
 go run ./cmd/sip-relay --config config.example.yaml
 ```
 
-Use application default credentials or set `ces.credentials_file` to a Google service account JSON file with access to the CES API.
+Configure each number under the top-level `extensions` map:
+
+```yaml
+ces:
+  project_id: project
+  location: us
+  app_id: app
+  endpoint: ces.googleapis.com:443
+  credentials_file: /app/credentials.json
+
+websocket:
+  base_url: http://telephony-service:8001
+  session_timeout: 15s
+  connect_timeout: 15s
+
+extensions:
+  "1014":
+    backend: ces
+  "1015":
+    backend: websocket
+```
+
+CES is gRPC-only. Use application default credentials or set `ces.credentials_file` to a Google service account JSON file. The WebSocket backend does not use CES configuration or Google credentials.
+`websocket.base_url` must contain only the HTTP(S) origin; the relay appends the fixed telephony API paths.
 
 ## Docker
 
@@ -40,13 +63,14 @@ If your deployment needs explicit memory tuning, pass Go runtime settings such a
 
 ## Call Logs And Recordings
 
-Set `call_log.pubsub_topic_id` to publish a JSON call log when a call ends. The message contains `call_id`, `ani`, `dnis`, `started_at`, `ended_at`, and `metadata`. For now, `metadata` contains all SIP headers from the inbound `INVITE` as header names mapped to arrays of values. `call_log.pubsub_project_id` is optional and defaults to `ces.project_id`.
+Set `call_log.pubsub_topic_id` and `call_log.pubsub_project_id` to publish a JSON call log when a call ends. The message identifies the selected `backend`, includes optional provider metadata, the conversation ID, ANI, DNIS, timestamps, and hangup reason. Set `call_log.credentials_file` when call logging should use explicit Google credentials.
 
-Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects are stored under the CES app ID as `<ces.app_id>/<call_id>.ulaw`.
+Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects are stored as `<backend>/<call_id>.ulaw`.
 
 ## SIP/Media Contract
 
 - Incoming SDP must offer `PCMU/8000`.
-- Incoming RTP payload bytes are batched into CES `SessionInput.Audio` messages with `AudioEncoding_MULAW`.
-- CES `SessionOutput.Audio` bytes are packetized into outbound RTP using the negotiated PCMU payload type.
+- CES routes send RTP payload bytes as gRPC `SessionInput.Audio` and packetize `SessionOutput.Audio` as outbound RTP.
+- WebSocket routes first POST `/api/v1/telephony/session`, then connect to `/api/v1/telephony/ws/{session_id}`. Inbound and outbound audio use binary frames containing raw PCMU bytes; text frames carry lifecycle, transcript, barge-in, and transfer events.
+- A `barge_in` event flushes buffered outbound audio. A `transfer` event closes the backend and terminates the SIP dialog with BYE so external telephony infrastructure can perform the human-queue routing.
 - Outbound RTP timestamps advance by the number of PCMU payload bytes sent.

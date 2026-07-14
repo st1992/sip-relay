@@ -15,21 +15,30 @@ rtp:
 ces:
   project_id: div-deai-cx-dev-usc1-ri
   location: us
+  app_id: 203a8f7e-7415-4d05-ac80-95617b3ad39b
+  deployment_id: dea554e4-5eeb-4cd6-88e2-1b0bb27eb250
   endpoint: ces.googleapis.com:443
-  transport: grpc
   credentials_file: "/home/sumeet1/sip-relay/credentials.json"
   session_prefix: sip
   noise_suppression_level: ""
   time_zone: ""
   use_tool_fakes: false
-  restart_on_goaway: false
-  extensions:
-    "1014":
-      app_id: 203a8f7e-7415-4d05-ac80-95617b3ad39b
-      deployment_id: dea554e4-5eeb-4cd6-88e2-1b0bb27eb250
+
+websocket:
+  base_url: http://127.0.0.1:8001
+  session_timeout: 15s
+  connect_timeout: 15s
+  max_message_bytes: 4194304
+
+extensions:
+  "1014":
+    backend: ces
+  "1015":
+    backend: websocket
 
 call_log:
   pubsub_project_id: div-deai-cx-dev-usc1-ri
   pubsub_topic_id: cx-gecx-topic
   recording_bucket: ""
+  credentials_file: "/home/sumeet1/sip-relay/credentials.json"
 

@@ -23,16 +23,14 @@ const uploadContentType = "audio/basic"
 var objectPartCleaner = regexp.MustCompile(`[^a-zA-Z0-9._=-]+`)
 
 type Entry struct {
-	ProjectID      string    `json:"project_id"`
-	Location       string    `json:"location"`
-	AppID          string    `json:"app_id"`
-	DeploymentID   string    `json:"deployment_id"`
-	ConversationID string    `json:"conversation_id"`
-	ANI            string    `json:"ani"`
-	DNIS           string    `json:"dnis"`
-	StartTime      time.Time `json:"start_time"`
-	EndTime        time.Time `json:"end_time"`
-	HangupReason   string    `json:"hangup_reason"`
+	Backend        string            `json:"backend"`
+	Provider       map[string]string `json:"provider,omitempty"`
+	ConversationID string            `json:"conversation_id"`
+	ANI            string            `json:"ani"`
+	DNIS           string            `json:"dnis"`
+	StartTime      time.Time         `json:"start_time"`
+	EndTime        time.Time         `json:"end_time"`
+	HangupReason   string            `json:"hangup_reason"`
 }
 
 type Recorder struct {
@@ -71,7 +69,7 @@ func (r *Recorder) Close() error {
 	return r.closeLocked()
 }
 
-func (r *Recorder) Upload(ctx context.Context, cfg *config.Config, callID string) (string, error) {
+func (r *Recorder) Upload(ctx context.Context, cfg *config.Config, backendName, callID string) (string, error) {
 	if r == nil || cfg == nil || cfg.CallLog.RecordingBucket == "" {
 		return "", nil
 	}
@@ -85,13 +83,13 @@ func (r *Recorder) Upload(ctx context.Context, cfg *config.Config, callID string
 		return "", err
 	}
 
-	client, err := storage.NewClient(ctx, clientOptions(cfg.CES)...)
+	client, err := storage.NewClient(ctx, clientOptions(cfg.CallLog.CredentialsFile)...)
 	if err != nil {
 		return "", err
 	}
 	defer client.Close()
 
-	objectName := RecordingObjectName(cfg.CES.AppID, callID)
+	objectName := RecordingObjectName(backendName, callID)
 	writer := client.Bucket(cfg.CallLog.RecordingBucket).Object(objectName).NewWriter(ctx)
 	writer.ContentType = uploadContentType
 	if _, err := io.Copy(writer, r.file); err != nil {
@@ -124,11 +122,7 @@ func Publish(ctx context.Context, cfg *config.Config, entry Entry) error {
 		return err
 	}
 
-	projectID := cfg.CallLog.PubSubProjectID
-	if projectID == "" {
-		projectID = cfg.CES.ProjectID
-	}
-	client, err := pubsub.NewClient(ctx, projectID, clientOptions(cfg.CES)...)
+	client, err := pubsub.NewClient(ctx, cfg.CallLog.PubSubProjectID, clientOptions(cfg.CallLog.CredentialsFile)...)
 	if err != nil {
 		return err
 	}
@@ -167,9 +161,9 @@ func cleanObjectPart(value string) string {
 	return value
 }
 
-func clientOptions(conf config.CESConfig) []option.ClientOption {
-	if conf.CredentialsFile == "" {
+func clientOptions(credentialsFile string) []option.ClientOption {
+	if credentialsFile == "" {
 		return nil
 	}
-	return []option.ClientOption{option.WithCredentialsFile(conf.CredentialsFile)}
+	return []option.ClientOption{option.WithCredentialsFile(credentialsFile)}
 }

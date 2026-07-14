@@ -5,6 +5,9 @@ import (
 	"testing"
 
 	sipmsg "github.com/livekit/sipgo/sip"
+
+	"sip-relay/internal/call"
+	"sip-relay/internal/config"
 )
 
 func TestRespondTryingSendsProvisionalResponse(t *testing.T) {
@@ -92,6 +95,79 @@ func TestServerBYEUsesServerSideDialogHeaders(t *testing.T) {
 	}
 	if got := bye.CSeq(); got == nil || got.MethodName != sipmsg.BYE || got.SeqNo != 8 {
 		t.Fatalf("cseq = %#v, want 8 BYE", got)
+	}
+}
+
+func TestServerBYEUsesUASRouteSetAndFirstProxyDestination(t *testing.T) {
+	invite := sipmsg.NewRequest(sipmsg.INVITE, sipmsg.Uri{User: "relay", Host: "example.com"})
+	invite.SetSource("198.51.100.10:5060")
+	invite.SetTransport("UDP")
+	invite.AppendHeader(sipmsg.NewHeader("Record-Route", "<sip:proxy-one.example.com:5070;lr>"))
+	invite.AppendHeader(sipmsg.NewHeader("Record-Route", "<sip:proxy-two.example.com:5080;lr>"))
+	invite.AppendHeader(&sipmsg.FromHeader{Address: sipmsg.Uri{User: "caller", Host: "example.com"}, Params: paramsWith("tag", "remote")})
+	invite.AppendHeader(&sipmsg.ToHeader{Address: sipmsg.Uri{User: "relay", Host: "example.com"}, Params: sipmsg.NewParams()})
+	callID := sipmsg.CallIDHeader("call-routed")
+	invite.AppendHeader(&callID)
+	invite.AppendHeader(&sipmsg.CSeqHeader{SeqNo: 1, MethodName: sipmsg.INVITE})
+	invite.AppendHeader(&sipmsg.ContactHeader{
+		Address: sipmsg.Uri{User: "caller", Host: "203.0.113.20", Port: 5060},
+		Params:  sipmsg.NewParams(),
+	})
+	ok := sipmsg.NewResponseFromRequest(invite, sipmsg.StatusOK, "OK", nil)
+	ok.To().Params.Add("tag", "local")
+
+	bye := newServerBYE(&dialog{invite: invite, ok: ok})
+	if bye == nil {
+		t.Fatal("missing BYE request")
+	}
+	routes := bye.GetHeaders("Route")
+	if len(routes) != 2 {
+		t.Fatalf("routes = %v", routes)
+	}
+	if routes[0].Value() != "<sip:proxy-one.example.com:5070;lr>" ||
+		routes[1].Value() != "<sip:proxy-two.example.com:5080;lr>" {
+		t.Fatalf("route order = %q, %q", routes[0].Value(), routes[1].Value())
+	}
+	if got := bye.Destination(); got != "proxy-one.example.com:5070" {
+		t.Fatalf("destination = %q", got)
+	}
+}
+
+func TestBackendForRouteSelectsIndependentBackend(t *testing.T) {
+	cfg := config.Default()
+	cfg.CES.SessionPrefix = "ces-prefix"
+
+	cesBackend, prefix, err := backendForRoute(cfg, config.ExtensionConfig{Backend: config.BackendCES})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cesBackend.Name() != config.BackendCES || prefix != "ces-prefix" {
+		t.Fatalf("CES backend = %q, prefix = %q", cesBackend.Name(), prefix)
+	}
+
+	wsBackend, prefix, err := backendForRoute(cfg, config.ExtensionConfig{Backend: config.BackendWebSocket})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wsBackend.Name() != config.BackendWebSocket || prefix != "sip" {
+		t.Fatalf("WebSocket backend = %q, prefix = %q", wsBackend.Name(), prefix)
+	}
+}
+
+func TestBackendTerminalReasonsSendBYE(t *testing.T) {
+	for _, reason := range []call.EndReason{
+		call.EndReasonAgent,
+		call.EndReasonTransfer,
+		call.EndReasonBackend,
+	} {
+		if !shouldSendBYE(reason) {
+			t.Errorf("shouldSendBYE(%s) = false", reason)
+		}
+	}
+	for _, reason := range []call.EndReason{call.EndReasonNone, call.EndReasonUser} {
+		if shouldSendBYE(reason) {
+			t.Errorf("shouldSendBYE(%s) = true", reason)
+		}
 	}
 }
 
