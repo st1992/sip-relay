@@ -356,6 +356,7 @@ type conversationHistory struct {
 	entries  []calllog.ConversationEvent
 	botText  strings.Builder
 	botStart time.Time
+	botEnd   time.Time
 }
 
 func (h *conversationHistory) appendBotDelta(text string) {
@@ -366,6 +367,7 @@ func (h *conversationHistory) appendBotDelta(text string) {
 		h.botStart = time.Now().UTC()
 	}
 	h.botText.WriteString(text)
+	h.botEnd = time.Now().UTC()
 }
 
 func (h *conversationHistory) flushBot() {
@@ -377,20 +379,24 @@ func (h *conversationHistory) flushBot() {
 		Role:      "bot",
 		Text:      h.botText.String(),
 		StartTime: h.botStart,
+		EndTime:   h.botEnd,
 	})
 	h.botText.Reset()
 	h.botStart = time.Time{}
+	h.botEnd = time.Time{}
 }
 
 func (h *conversationHistory) appendUser(text string) {
 	if text == "" {
 		return
 	}
+	now := time.Now().UTC()
 	h.entries = append(h.entries, calllog.ConversationEvent{
 		Type:      "message",
 		Role:      "user",
 		Text:      text,
-		StartTime: time.Now().UTC(),
+		StartTime: now,
+		EndTime:   now,
 	})
 }
 

@@ -41,6 +41,7 @@ type ConversationEvent struct {
 	Role      string    `json:"role"`
 	Text      string    `json:"text"`
 	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time"`
 }
 
 type Recorder struct {

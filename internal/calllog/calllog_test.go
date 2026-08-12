@@ -67,10 +67,11 @@ func TestRecorderUploadToleratesNilRecorder(t *testing.T) {
 
 func TestEntryJSONConversationHistoryFieldNamesAndTypes(t *testing.T) {
 	start := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	end := start.Add(3 * time.Second)
 	data, err := json.Marshal(Entry{
 		ConversationHistory: []ConversationEvent{
-			{Type: "message", Role: "bot", Text: "hi there", StartTime: start},
-			{Type: "message", Role: "user", Text: "hello", StartTime: start.Add(time.Second)},
+			{Type: "message", Role: "bot", Text: "hi there", StartTime: start, EndTime: end},
+			{Type: "message", Role: "user", Text: "hello", StartTime: start.Add(time.Second), EndTime: start.Add(time.Second)},
 		},
 	})
 	if err != nil {
@@ -95,6 +96,7 @@ func TestEntryJSONConversationHistoryFieldNamesAndTypes(t *testing.T) {
 		"role":       "bot",
 		"text":       "hi there",
 		"start_time": "2026-07-07T12:00:00Z",
+		"end_time":   "2026-07-07T12:00:03Z",
 	}
 	if len(first) != len(want) {
 		t.Fatalf("history[0] fields = %v, want exactly %v", first, want)

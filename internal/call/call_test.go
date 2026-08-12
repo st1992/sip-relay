@@ -130,12 +130,17 @@ func TestConversationHistorySkipsEmptyUserText(t *testing.T) {
 	if got[0].Type != "message" || got[0].Role != "user" || got[0].Text != "hi" {
 		t.Fatalf("entry = %+v, want {message user hi}", got[0])
 	}
+	if !got[0].StartTime.Equal(got[0].EndTime) {
+		t.Fatalf("user entry StartTime %v != EndTime %v, want equal (no duration signal exists for user speech)", got[0].StartTime, got[0].EndTime)
+	}
 }
 
-func TestConversationHistoryRecordsStartTimeOfFirstDeltaOnly(t *testing.T) {
+func TestConversationHistoryRecordsStartAndEndTimeOfBotUtterance(t *testing.T) {
 	var h conversationHistory
 	before := time.Now().UTC()
 	h.appendBotDelta("a")
+	time.Sleep(2 * time.Millisecond) // ensure a measurable gap between first and last delta
+	midpoint := time.Now().UTC()
 	h.appendBotDelta("b")
 	h.flushBot()
 	after := time.Now().UTC()
@@ -144,8 +149,14 @@ func TestConversationHistoryRecordsStartTimeOfFirstDeltaOnly(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("entries = %d, want 1", len(got))
 	}
-	if got[0].StartTime.Before(before) || got[0].StartTime.After(after) {
-		t.Fatalf("StartTime = %v, want within [%v, %v]", got[0].StartTime, before, after)
+	if got[0].StartTime.Before(before) || got[0].StartTime.After(midpoint) {
+		t.Fatalf("StartTime = %v, want within [%v, %v] (time of the first delta)", got[0].StartTime, before, midpoint)
+	}
+	if got[0].EndTime.Before(midpoint) || got[0].EndTime.After(after) {
+		t.Fatalf("EndTime = %v, want within [%v, %v] (time of the last delta, not the first)", got[0].EndTime, midpoint, after)
+	}
+	if !got[0].EndTime.After(got[0].StartTime) {
+		t.Fatalf("EndTime %v should be after StartTime %v given the gap between deltas", got[0].EndTime, got[0].StartTime)
 	}
 }
 
