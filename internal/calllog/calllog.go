@@ -23,14 +23,24 @@ const uploadContentType = "audio/basic"
 var objectPartCleaner = regexp.MustCompile(`[^a-zA-Z0-9._=-]+`)
 
 type Entry struct {
-	Backend        string            `json:"backend"`
-	Provider       map[string]string `json:"provider,omitempty"`
-	ConversationID string            `json:"conversation_id"`
-	ANI            string            `json:"ani"`
-	DNIS           string            `json:"dnis"`
-	StartTime      time.Time         `json:"start_time"`
-	EndTime        time.Time         `json:"end_time"`
-	HangupReason   string            `json:"hangup_reason"`
+	Backend             string              `json:"backend"`
+	Provider            map[string]string   `json:"provider,omitempty"`
+	ConversationID      string              `json:"conversation_id"`
+	ANI                 string              `json:"ani"`
+	DNIS                string              `json:"dnis"`
+	StartTime           time.Time           `json:"start_time"`
+	EndTime             time.Time           `json:"end_time"`
+	HangupReason        string              `json:"hangup_reason"`
+	ConversationHistory []ConversationEvent `json:"conversation_history,omitempty"`
+}
+
+// ConversationEvent is one entry in a call's conversation_history: a single
+// spoken message attributed to either the bot or the caller.
+type ConversationEvent struct {
+	Type      string    `json:"type"`
+	Role      string    `json:"role"`
+	Text      string    `json:"text"`
+	StartTime time.Time `json:"start_time"`
 }
 
 type Recorder struct {

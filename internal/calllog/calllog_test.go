@@ -65,6 +65,62 @@ func TestRecorderUploadToleratesNilRecorder(t *testing.T) {
 	}
 }
 
+func TestEntryJSONConversationHistoryFieldNamesAndTypes(t *testing.T) {
+	start := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	data, err := json.Marshal(Entry{
+		ConversationHistory: []ConversationEvent{
+			{Type: "message", Role: "bot", Text: "hi there", StartTime: start},
+			{Type: "message", Role: "user", Text: "hello", StartTime: start.Add(time.Second)},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	history, ok := got["conversation_history"].([]any)
+	if !ok || len(history) != 2 {
+		t.Fatalf("conversation_history = %#v", got["conversation_history"])
+	}
+	first, ok := history[0].(map[string]any)
+	if !ok {
+		t.Fatalf("history[0] = %#v", history[0])
+	}
+	want := map[string]any{
+		"type":       "message",
+		"role":       "bot",
+		"text":       "hi there",
+		"start_time": "2026-07-07T12:00:00Z",
+	}
+	if len(first) != len(want) {
+		t.Fatalf("history[0] fields = %v, want exactly %v", first, want)
+	}
+	for key, value := range want {
+		if first[key] != value {
+			t.Errorf("history[0][%q] = %v, want %v", key, first[key], value)
+		}
+	}
+}
+
+func TestEntryJSONOmitsConversationHistoryWhenEmpty(t *testing.T) {
+	data, err := json.Marshal(Entry{Backend: "ces"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["conversation_history"]; ok {
+		t.Fatalf("conversation_history present when ConversationHistory was nil: %v", got["conversation_history"])
+	}
+}
+
 func TestEntryJSONIncludesOnlyCallEventFields(t *testing.T) {
 	start := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
 	end := start.Add(time.Minute)

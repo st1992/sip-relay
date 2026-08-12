@@ -66,9 +66,128 @@ func TestReceiveBackendTreatsClosedEventsAsFailure(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := c.receiveBackend(ctx, stream, nil, &mediaStats{})
+	err := c.receiveBackend(ctx, stream, nil, &mediaStats{}, &conversationHistory{})
 	if err == nil || err.Error() != "backend events channel closed unexpectedly" {
 		t.Fatalf("receiveBackend() error = %v", err)
+	}
+}
+
+func TestConversationHistoryAccumulatesBotDeltasUntilFlush(t *testing.T) {
+	var h conversationHistory
+	h.appendBotDelta("Hello ")
+	h.appendBotDelta("there.")
+	h.flushBot()
+
+	got := h.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("entries = %d, want 1", len(got))
+	}
+	if got[0].Type != "message" || got[0].Role != "bot" || got[0].Text != "Hello there." {
+		t.Fatalf("entry = %+v, want {message bot \"Hello there.\"}", got[0])
+	}
+}
+
+func TestConversationHistoryFlushBotIsNoopWhenNothingPending(t *testing.T) {
+	var h conversationHistory
+	h.flushBot()
+	if got := h.snapshot(); len(got) != 0 {
+		t.Fatalf("entries = %d, want 0", len(got))
+	}
+
+	h.appendBotDelta("hi")
+	h.flushBot()
+	h.flushBot() // second flush with nothing new pending must not duplicate
+	if got := h.snapshot(); len(got) != 1 {
+		t.Fatalf("entries = %d, want 1", len(got))
+	}
+}
+
+func TestConversationHistoryFlushSeparatesConsecutiveUtterances(t *testing.T) {
+	var h conversationHistory
+	h.appendBotDelta("first")
+	h.flushBot()
+	h.appendBotDelta("second")
+	h.flushBot()
+
+	got := h.snapshot()
+	if len(got) != 2 {
+		t.Fatalf("entries = %d, want 2", len(got))
+	}
+	if got[0].Text != "first" || got[1].Text != "second" {
+		t.Fatalf("entries = %+v, want [first second]", got)
+	}
+}
+
+func TestConversationHistorySkipsEmptyUserText(t *testing.T) {
+	var h conversationHistory
+	h.appendUser("")
+	h.appendUser("hi")
+
+	got := h.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("entries = %d, want 1", len(got))
+	}
+	if got[0].Type != "message" || got[0].Role != "user" || got[0].Text != "hi" {
+		t.Fatalf("entry = %+v, want {message user hi}", got[0])
+	}
+}
+
+func TestConversationHistoryRecordsStartTimeOfFirstDeltaOnly(t *testing.T) {
+	var h conversationHistory
+	before := time.Now().UTC()
+	h.appendBotDelta("a")
+	h.appendBotDelta("b")
+	h.flushBot()
+	after := time.Now().UTC()
+
+	got := h.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("entries = %d, want 1", len(got))
+	}
+	if got[0].StartTime.Before(before) || got[0].StartTime.After(after) {
+		t.Fatalf("StartTime = %v, want within [%v, %v]", got[0].StartTime, before, after)
+	}
+}
+
+func TestReceiveBackendBuildsConversationHistory(t *testing.T) {
+	events := make(chan backend.Event, 16)
+	events <- backend.Event{Type: backend.EventBotTranscript, Text: "Hello "}
+	events <- backend.Event{Type: backend.EventBotTranscript, Text: "there."}
+	events <- backend.Event{Type: backend.EventTurnComplete}
+	events <- backend.Event{Type: backend.EventUserTranscript, Text: "Hi bot"}
+	events <- backend.Event{Type: backend.EventBotTranscript, Text: "Let me think"}
+	events <- backend.Event{Type: backend.EventBargeIn}
+	events <- backend.Event{Type: backend.EventBotTranscript, Text: "Sure, here's the answer."}
+	events <- backend.Event{Type: backend.EventTurnComplete}
+	events <- backend.Event{Type: backend.EventEndSession}
+
+	stream := &fakeBackendStream{events: events}
+	c := New("call-1", Metadata{}, nil, nil, nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	history := &conversationHistory{}
+	if err := c.receiveBackend(ctx, stream, nil, &mediaStats{}, history); err != nil {
+		t.Fatalf("receiveBackend() error = %v", err)
+	}
+
+	got := history.snapshot()
+	want := []struct {
+		role string
+		text string
+	}{
+		{"bot", "Hello there."},
+		{"user", "Hi bot"},
+		{"bot", "Let me think"}, // barge-in must flush this separately from what follows
+		{"bot", "Sure, here's the answer."},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("history = %+v, want %d entries", got, len(want))
+	}
+	for i, w := range want {
+		if got[i].Type != "message" || got[i].Role != w.role || got[i].Text != w.text {
+			t.Errorf("entry %d = %+v, want {message %s %q}", i, got[i], w.role, w.text)
+		}
 	}
 }
 

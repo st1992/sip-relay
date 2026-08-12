@@ -311,6 +311,8 @@ func (s *stream) handleEvent(ctx context.Context, event wireEvent) (bool, error)
 		return false, s.emitError(ctx, backend.Event{Type: backend.EventTurnComplete})
 	case "barge_in":
 		return false, s.emitError(ctx, backend.Event{Type: backend.EventBargeIn})
+	case "clear":
+		return false, s.emitError(ctx, backend.Event{Type: backend.EventBargeIn})
 	case "transfer":
 		if !s.emit(ctx, backend.Event{Type: backend.EventTransfer}) {
 			return true, ctx.Err()

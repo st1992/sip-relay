@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -126,9 +127,10 @@ func (c *Call) run(ctx context.Context) {
 	if err != nil {
 		c.Log.Error("failed to create call recorder", "error", err)
 	}
+	history := &conversationHistory{}
 	// Register finalization first so media teardown and Done notification happen
 	// before potentially slow storage or Pub/Sub operations.
-	defer c.finish(startedAt, recorder)
+	defer c.finish(startedAt, recorder, history)
 	defer c.finishDone()
 	defer c.Close()
 
@@ -155,15 +157,34 @@ func (c *Call) run(ctx context.Context) {
 	}()
 
 	mediaCtx, stopMedia := context.WithCancel(ctx)
+	// mediaWG.Wait, once mediaCtx is canceled, guarantees receiveBackend has
+	// fully stopped (and so is done writing to history) before finish()
+	// reads it below -- required for a correct, race-free conversation
+	// history, not just tidiness. Defers run LIFO, so registering Wait
+	// before stopMedia here means stopMedia (the cancel) runs first during
+	// unwind and Wait (which needs that cancel to unblock the goroutines)
+	// runs second; reversing this order would deadlock.
+	//
+	// Known tradeoff: recorder.Write (used by both goroutines below) is not
+	// context-aware -- if it ever stalled, Wait would block the whole
+	// call's finalization (Done(), Pub/Sub publish, recording upload)
+	// instead of just leaking one goroutine as it would have before this
+	// change. Accepted: it's a local temp-file write, not expected to
+	// stall in practice.
+	var mediaWG sync.WaitGroup
+	defer mediaWG.Wait()
 	defer stopMedia()
 
 	stats := &mediaStats{}
 	mediaErr := make(chan error, 2)
+	mediaWG.Add(2)
 	go func() {
+		defer mediaWG.Done()
 		mediaErr <- c.sendRTPToBackend(mediaCtx, stream, recorder, stats)
 	}()
 	go func() {
-		mediaErr <- c.receiveBackend(mediaCtx, stream, recorder, stats)
+		defer mediaWG.Done()
+		mediaErr <- c.receiveBackend(mediaCtx, stream, recorder, stats, history)
 	}()
 
 	defer func() {
@@ -321,7 +342,68 @@ func (s *mediaStats) snapshot() mediaStatsSnapshot {
 	}
 }
 
-func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
+// conversationHistory accumulates the call's spoken transcript for
+// inclusion in the Pub/Sub call log. Bot transcript text arrives as
+// streaming deltas (not complete messages) on both backends, so deltas are
+// buffered and only turned into one ConversationEvent when a turn boundary
+// is reached (EventTurnComplete, or EventBargeIn cutting a turn short).
+// User transcript text has no equivalent turn-boundary signal on either
+// backend, so each occurrence becomes its own entry immediately.
+//
+// Always used via *conversationHistory: it embeds a strings.Builder, which
+// panics if copied after its first write.
+type conversationHistory struct {
+	entries  []calllog.ConversationEvent
+	botText  strings.Builder
+	botStart time.Time
+}
+
+func (h *conversationHistory) appendBotDelta(text string) {
+	if text == "" {
+		return
+	}
+	if h.botText.Len() == 0 {
+		h.botStart = time.Now().UTC()
+	}
+	h.botText.WriteString(text)
+}
+
+func (h *conversationHistory) flushBot() {
+	if h.botText.Len() == 0 {
+		return
+	}
+	h.entries = append(h.entries, calllog.ConversationEvent{
+		Type:      "message",
+		Role:      "bot",
+		Text:      h.botText.String(),
+		StartTime: h.botStart,
+	})
+	h.botText.Reset()
+	h.botStart = time.Time{}
+}
+
+func (h *conversationHistory) appendUser(text string) {
+	if text == "" {
+		return
+	}
+	h.entries = append(h.entries, calllog.ConversationEvent{
+		Type:      "message",
+		Role:      "user",
+		Text:      text,
+		StartTime: time.Now().UTC(),
+	})
+}
+
+func (h *conversationHistory) snapshot() []calllog.ConversationEvent {
+	return h.entries
+}
+
+func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats, history *conversationHistory) error {
+	// Catches a bot utterance still in progress on any exit path below
+	// (ctx cancellation, events channel closing, transfer/end/go-away)
+	// rather than silently dropping it.
+	defer history.flushBot()
+
 	outboundRTP := newOutboundRTPWriter(ctx, c.RTP, c.Log, stats)
 	for {
 		select {
@@ -343,15 +425,22 @@ func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, record
 				}
 			case backend.EventBotTranscript:
 				c.Log.Info("received bot transcript", "text", event.Text)
+				history.appendBotDelta(event.Text)
 			case backend.EventUserTranscript:
 				c.Log.Info("received user transcript", "text", event.Text)
+				history.appendUser(event.Text)
 			case backend.EventBargeIn:
 				c.Log.Info("barge-in signal received")
+				// A turn boundary too: without this, a bot utterance cut
+				// off by barge-in would silently merge with the next
+				// turn's deltas into one bogus entry.
+				history.flushBot()
 				if !outboundRTP.Interrupt() {
 					return nil
 				}
 			case backend.EventTurnComplete:
 				c.Log.Info("bot turn completed")
+				history.flushBot()
 			case backend.EventEndSession:
 				c.Log.Info("backend ended session")
 				c.setEndReason(EndReasonAgent)
@@ -615,7 +704,7 @@ type dialResult struct {
 	err    error
 }
 
-func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
+func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder, history *conversationHistory) {
 	endedAt := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 	defer cancel()
@@ -630,14 +719,15 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 		}
 	}
 	if err := c.CallLog.Publish(ctx, calllog.Entry{
-		Backend:        c.Backend.Name(),
-		Provider:       c.Backend.Metadata(),
-		ConversationID: c.ID,
-		ANI:            c.Metadata.ANI,
-		DNIS:           c.Metadata.DNIS,
-		StartTime:      startedAt,
-		EndTime:        endedAt,
-		HangupReason:   c.hangupReason(),
+		Backend:             c.Backend.Name(),
+		Provider:            c.Backend.Metadata(),
+		ConversationID:      c.ID,
+		ANI:                 c.Metadata.ANI,
+		DNIS:                c.Metadata.DNIS,
+		StartTime:           startedAt,
+		EndTime:             endedAt,
+		HangupReason:        c.hangupReason(),
+		ConversationHistory: history.snapshot(),
 	}); err != nil {
 		c.Log.Error("failed to publish call log", "error", err)
 	}
