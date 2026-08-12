@@ -377,6 +377,19 @@ func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, record
 // produces audio faster than the call can play it back will ever hit it.
 const maxQueuedOutboundBytes = 30 * relayrtp.SampleRate
 
+// minOutboundBufferBytes is the minimum amount of backend audio held in
+// reserve before the pacer starts draining it to the caller -- and again
+// after any underrun, before resuming. Without this, real audio gets played
+// the instant it arrives with nothing in reserve, so any further delivery
+// jitter immediately causes another audible dropout: a repeating
+// burst/silence stutter under chronically uneven backend delivery, not just
+// an occasional glitch. This mirrors LiveKit SIP's own outbound jitter
+// buffer (media-sdk's mixer.Input: a ~100ms ring buffer gated on a 60ms
+// minimum fill, re-armed after every starve). 60ms (3 frames) absorbs
+// typical delivery jitter at the cost of a small, fixed, and imperceptible
+// amount of onset latency per utterance.
+const minOutboundBufferBytes = 3 * relayrtp.SamplesPerFrame
+
 type outboundRTPCommand struct {
 	audio     []byte
 	interrupt bool
@@ -390,20 +403,22 @@ type outboundRTPWriter struct {
 	commands chan outboundRTPCommand
 	write    chan []byte
 
-	// queuedBytes and overCap are only ever touched from the manage()
-	// goroutine, so they need no synchronization of their own.
+	// queuedBytes, overCap, and buffering are only ever touched from the
+	// manage() goroutine, so they need no synchronization of their own.
 	queuedBytes int
 	overCap     bool
+	buffering   bool
 }
 
 func newOutboundRTPWriter(ctx context.Context, port *relayrtp.Port, log *slog.Logger, stats *mediaStats) *outboundRTPWriter {
 	writer := &outboundRTPWriter{
-		ctx:      ctx,
-		port:     port,
-		log:      log,
-		stats:    stats,
-		commands: make(chan outboundRTPCommand),
-		write:    make(chan []byte),
+		ctx:       ctx,
+		port:      port,
+		log:       log,
+		stats:     stats,
+		commands:  make(chan outboundRTPCommand),
+		write:     make(chan []byte),
+		buffering: true,
 	}
 	go writer.manage()
 	go writer.writeLoop()
@@ -433,7 +448,7 @@ func (w *outboundRTPWriter) manage() {
 
 	var queue [][]byte
 	for {
-		if len(queue) == 0 {
+		if w.buffering || len(queue) == 0 {
 			select {
 			case <-w.ctx.Done():
 				return
@@ -459,6 +474,11 @@ func (w *outboundRTPWriter) manage() {
 			w.queuedBytes -= len(queue[0])
 			queue[0] = nil
 			queue = queue[1:]
+			if len(queue) == 0 {
+				// Underrun: demand a fresh cushion before resuming, rather
+				// than immediately playing whatever lands next.
+				w.buffering = true
+			}
 		}
 	}
 }
@@ -471,6 +491,7 @@ func (w *outboundRTPWriter) handleCommand(queue [][]byte, cmd outboundRTPCommand
 		}
 		w.queuedBytes = 0
 		w.overCap = false
+		w.buffering = true
 		return queue[:0]
 	}
 	if len(cmd.audio) == 0 {
@@ -489,7 +510,11 @@ func (w *outboundRTPWriter) handleCommand(queue [][]byte, cmd outboundRTPCommand
 	}
 	w.overCap = false
 	w.queuedBytes += len(cmd.audio)
-	return append(queue, cmd.audio)
+	queue = append(queue, cmd.audio)
+	if w.buffering && w.queuedBytes >= minOutboundBufferBytes {
+		w.buffering = false
+	}
+	return queue
 }
 
 // writeLoop drains queued backend audio onto the RTP port. Real audio always

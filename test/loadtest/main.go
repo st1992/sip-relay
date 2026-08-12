@@ -36,6 +36,7 @@ func main() {
 	stallProb := flag.Float64("stall-prob", 0.15, "probability that a backend delivery step stalls")
 	stallMin := flag.Duration("stall-min", 150*time.Millisecond, "minimum injected backend stall")
 	stallMax := flag.Duration("stall-max", 400*time.Millisecond, "maximum injected backend stall")
+	chunkMillis := flag.Int("chunk-ms", 100, "audio duration per simulated backend delivery chunk (smaller = finer-grained streaming, e.g. word-by-word TTS)")
 	seed := flag.Int64("seed", time.Now().UnixNano(), "PRNG seed")
 	flag.Parse()
 
@@ -43,12 +44,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, "stall-max must be >= stall-min")
 		os.Exit(1)
 	}
+	if *chunkMillis <= 0 {
+		fmt.Fprintln(os.Stderr, "chunk-ms must be positive")
+		os.Exit(1)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	jitter := jitterProfile{stallProb: *stallProb, stallMin: *stallMin, stallMax: *stallMax}
+	jitter := jitterProfile{stallProb: *stallProb, stallMin: *stallMin, stallMax: *stallMax, chunkMillis: *chunkMillis}
 
-	fmt.Printf("running %d concurrent simulated calls for %s (backend stall: %.0f%% chance, %s-%s)\n",
-		*calls, *duration, *stallProb*100, *stallMin, *stallMax)
+	fmt.Printf("running %d concurrent simulated calls for %s (backend stall: %.0f%% chance, %s-%s, chunk=%dms)\n",
+		*calls, *duration, *stallProb*100, *stallMin, *stallMax, *chunkMillis)
 
 	results := make(chan callResult, *calls)
 	var wg sync.WaitGroup
@@ -70,14 +75,16 @@ func main() {
 type jitterProfile struct {
 	stallProb          float64
 	stallMin, stallMax time.Duration
+	chunkMillis        int
 }
 
 type callResult struct {
-	idx           int
-	gaps          []time.Duration
-	silenceFrames int
-	realFrames    int
-	err           error
+	idx            int
+	gaps           []time.Duration
+	silenceFrames  int
+	realFrames     int
+	realRunLengths []int
+	err            error
 }
 
 // runSimulatedCall wires up one call.Call against a real loopback RTP port
@@ -126,7 +133,7 @@ func runSimulatedCall(idx int, duration time.Duration, jitter jitterProfile, rng
 	<-c.Done()
 	c.Close()
 
-	return callResult{idx: idx, gaps: col.gaps, silenceFrames: col.silence, realFrames: col.real}
+	return callResult{idx: idx, gaps: col.gaps, silenceFrames: col.silence, realFrames: col.real, realRunLengths: col.realRunLengths}
 }
 
 // feedInboundRTP simulates the caller sending steady PCMU audio so the
@@ -166,6 +173,15 @@ type collected struct {
 	gaps    []time.Duration
 	silence int
 	real    int
+	// realRunLengths records the packet-count length of each contiguous run
+	// of real-audio packets (runs separated by at least one silence
+	// packet). This is what the outbound jitter buffer specifically
+	// targets: chronic mid-utterance backend jitter fragments what should
+	// be one continuous burst of speech into many short real-audio runs
+	// separated by comfort-noise dropouts. Holding a playout cushion turns
+	// many short runs into fewer, longer ones for the same underlying
+	// jitter, even though total real/silence byte counts barely change.
+	realRunLengths []int
 }
 
 // collectOutbound reads every RTP packet the relay sends to the simulated
@@ -174,17 +190,27 @@ type collected struct {
 func collectOutbound(phone *net.UDPConn, duration time.Duration) collected {
 	var res collected
 	var last time.Time
+	runLen := 0
 	buf := make([]byte, 1500)
 	deadline := time.Now().Add(duration + time.Second)
+
+	flushRun := func() {
+		if runLen > 0 {
+			res.realRunLengths = append(res.realRunLengths, runLen)
+			runLen = 0
+		}
+	}
 
 	for {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
+			flushRun()
 			return res
 		}
 		_ = phone.SetReadDeadline(time.Now().Add(remaining))
 		n, _, err := phone.ReadFromUDP(buf)
 		if err != nil {
+			flushRun()
 			return res
 		}
 		now := time.Now()
@@ -199,8 +225,10 @@ func collectOutbound(phone *net.UDPConn, duration time.Duration) collected {
 		last = now
 		if isSilence(pkt.Payload) {
 			res.silence++
+			flushRun()
 		} else {
 			res.real++
+			runLen++
 		}
 	}
 }
@@ -281,13 +309,17 @@ func (s *mockStream) talk(ctx context.Context, jitter jitterProfile, rng *rand.R
 	}
 }
 
-// speakUtterance streams ~2 seconds of synthetic PCMU audio as ~100ms
-// delivery chunks, each delayed by a jittered interval that occasionally
-// (per jitterProfile) stalls hard -- the network/TTS hiccup this whole
-// exercise is meant to expose.
+// speakUtterance streams ~2 seconds of synthetic PCMU audio as delivery
+// chunks sized by jitter.chunkMillis, each delayed by a jittered interval
+// (nominally close to real-time for that chunk size) that occasionally (per
+// jitterProfile) stalls hard -- the network/TTS hiccup this whole exercise
+// is meant to expose. Smaller chunk-ms simulates finer-grained streaming
+// (e.g. word-by-word TTS deltas), which is where a jitter buffer's benefit
+// of merging many small hiccups into fewer, longer playback runs actually
+// shows up; larger chunk-ms simulates coarser, sentence-level delivery.
 func (s *mockStream) speakUtterance(ctx context.Context, jitter jitterProfile, rng *rand.Rand) bool {
 	const totalBytes = 8000 * 2
-	const chunkBytes = 800
+	chunkBytes := jitter.chunkMillis * 8 // 8 bytes/ms of PCMU at 8kHz mono
 
 	sent := 0
 	for sent < totalBytes {
@@ -300,7 +332,8 @@ func (s *mockStream) speakUtterance(ctx context.Context, jitter jitterProfile, r
 			chunk[i] = 0x01 // any non-silence byte marks this as "real" audio
 		}
 
-		delay := time.Duration(80+rng.Intn(40)) * time.Millisecond
+		nominal := float64(jitter.chunkMillis) * (0.8 + 0.4*rng.Float64())
+		delay := time.Duration(nominal * float64(time.Millisecond))
 		if rng.Float64() < jitter.stallProb {
 			delay += jitter.stallMin + time.Duration(rng.Int63n(int64(jitter.stallMax-jitter.stallMin+1)))
 		}
@@ -331,6 +364,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 	var allGaps []time.Duration
+	var allRunLengths []int
 	var totalSilence, totalReal, errs int
 	for r := range results {
 		if r.err != nil {
@@ -341,8 +375,10 @@ func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 		allGaps = append(allGaps, r.gaps...)
 		totalSilence += r.silenceFrames
 		totalReal += r.realFrames
+		allRunLengths = append(allRunLengths, r.realRunLengths...)
 	}
 	sort.Slice(allGaps, func(i, j int) bool { return allGaps[i] < allGaps[j] })
+	sort.Ints(allRunLengths)
 
 	fmt.Printf("\nsimulated calls: %d (errors: %d)\n", numCalls, errs)
 	fmt.Printf("wall time: %s\n", elapsed)
@@ -356,6 +392,17 @@ func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 		fillPct = 100 * float64(totalSilence) / float64(total)
 	}
 	fmt.Printf("outbound RTP frames observed: %d real, %d comfort-noise (%.1f%% fill)\n", totalReal, totalSilence, fillPct)
+
+	if len(allRunLengths) > 0 {
+		sum := 0
+		for _, l := range allRunLengths {
+			sum += l
+		}
+		mean := float64(sum) / float64(len(allRunLengths))
+		fmt.Printf("real-audio run lengths (packets between comfort-noise dropouts): count=%d p50=%d p95=%d mean=%.1f max=%d\n",
+			len(allRunLengths), pctInt(allRunLengths, 0.50), pctInt(allRunLengths, 0.95), mean, allRunLengths[len(allRunLengths)-1])
+		fmt.Println("  (higher/longer runs = smoother; many short runs = audible stutter)")
+	}
 
 	if len(allGaps) == 0 {
 		fmt.Println("no inter-packet gaps recorded")
@@ -380,6 +427,14 @@ func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 }
 
 func pct(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(p * float64(len(sorted)-1))
+	return sorted[idx]
+}
+
+func pctInt(sorted []int, p float64) int {
 	if len(sorted) == 0 {
 		return 0
 	}

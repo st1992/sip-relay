@@ -1,6 +1,7 @@
 package call
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net"
@@ -105,12 +106,109 @@ func TestOutboundRTPWriterFillsUnderrunWithSilence(t *testing.T) {
 		t.Fatalf("silence packets were not sent back to back: seq %d then %d", first.SequenceNumber, second.SequenceNumber)
 	}
 
+	// Below the minimum buffer threshold, the writer must keep withholding
+	// playback (still silence) rather than draining prematurely.
 	if !writer.Enqueue([]byte{1, 2, 3}) {
 		t.Fatal("Enqueue returned false")
 	}
-	real := readCallPacket(t, peer)
-	if string(real.Payload) != string([]byte{1, 2, 3}) {
-		t.Fatalf("expected queued real audio to take priority, got %v", real.Payload)
+	stillSilence := readCallPacket(t, peer)
+	if stillSilence.Payload[0] != relayrtp.SilenceByte {
+		t.Fatalf("expected continued silence below the buffer threshold, got %v", stillSilence.Payload)
+	}
+
+	// Crossing the threshold must make it drain, in order.
+	rest := minOutboundBufferBytes - 3
+	if !writer.Enqueue(bytes.Repeat([]byte{2}, rest)) {
+		t.Fatal("Enqueue returned false")
+	}
+	firstReal := readCallPacket(t, peer)
+	if string(firstReal.Payload[:3]) != string([]byte{1, 2, 3}) {
+		t.Fatalf("expected the first queued chunk to play first once threshold reached, got %v", firstReal.Payload)
+	}
+}
+
+func TestOutboundRTPWriterRebuffersAfterUnderrun(t *testing.T) {
+	port, err := relayrtp.Listen(relayrtp.Config{
+		ListenIP:            "127.0.0.1",
+		PayloadType:         0,
+		MediaTimeoutInitial: time.Second,
+		MediaTimeout:        time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer port.Close()
+
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer := newOutboundRTPWriter(ctx, port, slog.Default(), &mediaStats{})
+
+	// minOutboundBufferBytes divides evenly into SamplesPerFrame-sized RTP
+	// packets, so enqueuing exactly that much plays as real audio with no
+	// silence interleaved, then the queue empties (underrun).
+	full := bytes.Repeat([]byte{1}, minOutboundBufferBytes)
+	if !writer.Enqueue(full) {
+		t.Fatal("Enqueue returned false")
+	}
+	for i := 0; i < minOutboundBufferBytes/relayrtp.SamplesPerFrame; i++ {
+		pkt := readCallPacket(t, peer)
+		if pkt.Payload[0] != 1 {
+			t.Fatalf("packet %d: expected real audio content, got %v", i, pkt.Payload)
+		}
+	}
+
+	// Immediately after the underrun, output must be silence.
+	afterUnderrun := readCallPacket(t, peer)
+	if afterUnderrun.Payload[0] != relayrtp.SilenceByte {
+		t.Fatalf("expected silence immediately after underrun, got %v", afterUnderrun.Payload)
+	}
+
+	// A small chunk arriving after the underrun must NOT play immediately --
+	// the writer should demand a fresh cushion again, not resume instantly.
+	if !writer.Enqueue([]byte{9, 9, 9}) {
+		t.Fatal("Enqueue returned false")
+	}
+	stillSilence := readCallPacket(t, peer)
+	if stillSilence.Payload[0] != relayrtp.SilenceByte {
+		t.Fatalf("expected continued silence after a post-underrun chunk below the buffer threshold, got %v", stillSilence.Payload)
+	}
+}
+
+func TestHandleCommandGatesOnMinBufferBeforeDraining(t *testing.T) {
+	w := &outboundRTPWriter{log: slog.Default(), port: &relayrtp.Port{}, buffering: true}
+
+	var queue [][]byte
+	queue = w.handleCommand(queue, outboundRTPCommand{audio: make([]byte, minOutboundBufferBytes-1)})
+	if !w.buffering {
+		t.Fatal("buffering should remain true below the minimum buffer threshold")
+	}
+
+	queue = w.handleCommand(queue, outboundRTPCommand{audio: []byte{0}})
+	if w.buffering {
+		t.Fatal("buffering should clear once the minimum buffer threshold is reached")
+	}
+	if len(queue) != 2 {
+		t.Fatalf("queue len = %d, want 2", len(queue))
+	}
+}
+
+func TestHandleCommandInterruptRearmsBuffering(t *testing.T) {
+	w := &outboundRTPWriter{log: slog.Default(), port: &relayrtp.Port{}, buffering: false, queuedBytes: 10}
+	queue := [][]byte{make([]byte, 10)}
+
+	queue = w.handleCommand(queue, outboundRTPCommand{interrupt: true})
+	if !w.buffering {
+		t.Fatal("interrupt should re-arm buffering so playback resumes with a fresh cushion")
+	}
+	if len(queue) != 0 || w.queuedBytes != 0 {
+		t.Fatalf("interrupt should reset queue and queuedBytes, got len=%d queuedBytes=%d", len(queue), w.queuedBytes)
 	}
 }
 
