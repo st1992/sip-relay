@@ -177,6 +177,48 @@ func TestStreamReportsMalformedJSONEvent(t *testing.T) {
 	}
 }
 
+func TestUnrecognizedEventTypeDoesNotTerminateTheCall(t *testing.T) {
+	// Regression test: a backend emitting an event type outside this
+	// relay's documented set (e.g. an internal orchestration signal like
+	// "brain_node") must not tear down an otherwise-healthy call -- it
+	// should be ignored, and subsequent legitimate events must still flow.
+	upgrader := gorillaws.Upgrader{}
+	mux := http.NewServeMux()
+	mux.HandleFunc(sessionPath, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(sessionResponse{SessionID: testSessionID})
+	})
+	mux.HandleFunc(websocketPath+testSessionID, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.WriteJSON(wireEvent{Type: "ready", SessionID: testSessionID})
+		_ = conn.WriteJSON(wireEvent{Type: "brain_node"})
+		_ = conn.WriteJSON(wireEvent{Type: "bot_transcript", Delta: "still alive"})
+		<-time.After(200 * time.Millisecond)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	stream, err := (Dialer{Config: testConfig(server.URL)}).Dial(context.Background(), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+
+	select {
+	case event := <-stream.Events():
+		if event.Type != backend.EventBotTranscript || event.Text != "still alive" {
+			t.Fatalf("event = %+v, want bot transcript delivered after the unrecognized event", event)
+		}
+	case err := <-stream.Done():
+		t.Fatalf("stream terminated on an unrecognized event type: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the event that follows the unrecognized one")
+	}
+}
+
 func TestLifecycleEventsTerminateWithTypedReasons(t *testing.T) {
 	tests := []struct {
 		eventType string

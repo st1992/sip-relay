@@ -331,7 +331,12 @@ func (s *stream) handleEvent(ctx context.Context, event wireEvent) (bool, error)
 	case "ready":
 		return true, errors.New("telephony websocket sent duplicate ready event")
 	default:
-		return true, fmt.Errorf("unknown telephony websocket event type %q", event.Type)
+		// Unrecognized event types are ignored rather than treated as fatal:
+		// the backend may emit internal/lifecycle events outside this
+		// relay's documented contract (e.g. orchestration signals), and none
+		// of those should be able to tear down an otherwise-healthy call.
+		s.log.Info("ignoring unrecognized telephony websocket event type", "type", event.Type)
+		return false, nil
 	}
 }
 
