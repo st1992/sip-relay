@@ -1,9 +1,12 @@
 package calllog
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
+
+	"sip-relay/internal/config"
 )
 
 func TestRecordingObjectNameStoresUnderBackend(t *testing.T) {
@@ -19,6 +22,46 @@ func TestRecordingObjectNameFallsBackForEmptyParts(t *testing.T) {
 	want := "unknown/unknown.ulaw"
 	if got != want {
 		t.Fatalf("RecordingObjectName() = %q, want %q", got, want)
+	}
+}
+
+func TestNewClientsSkipsUnconfiguredServices(t *testing.T) {
+	clients, err := NewClients(context.Background(), &config.Config{})
+	if err != nil {
+		t.Fatalf("NewClients() error = %v, want nil (no network call for an unconfigured call_log)", err)
+	}
+	if clients.storage != nil {
+		t.Fatal("storage client should not be created when recording_bucket is unset")
+	}
+	if clients.publisher != nil {
+		t.Fatal("publisher should not be created when pubsub_topic_id is unset")
+	}
+
+	// Both Upload and Publish must be safe no-ops when their backing client
+	// was never created, since neither service is configured.
+	if err := clients.Publish(context.Background(), Entry{}); err != nil {
+		t.Fatalf("Publish() with no publisher = %v, want nil", err)
+	}
+	recorder := &Recorder{}
+	if uri, err := recorder.Upload(context.Background(), clients, "ces", "call-1"); err != nil || uri != "" {
+		t.Fatalf("Upload() with no storage client = (%q, %v), want (\"\", nil)", uri, err)
+	}
+
+	clients.Close()
+}
+
+func TestClientsPublishAndCloseToleratesNilReceiver(t *testing.T) {
+	var clients *Clients
+	if err := clients.Publish(context.Background(), Entry{}); err != nil {
+		t.Fatalf("Publish() on nil *Clients = %v, want nil", err)
+	}
+	clients.Close()
+}
+
+func TestRecorderUploadToleratesNilRecorder(t *testing.T) {
+	var recorder *Recorder
+	if uri, err := recorder.Upload(context.Background(), &Clients{}, "ces", "call-1"); err != nil || uri != "" {
+		t.Fatalf("Upload() on nil *Recorder = (%q, %v), want (\"\", nil)", uri, err)
 	}
 }
 

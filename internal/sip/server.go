@@ -18,6 +18,7 @@ import (
 
 	"sip-relay/internal/backend"
 	"sip-relay/internal/call"
+	"sip-relay/internal/calllog"
 	"sip-relay/internal/ces"
 	"sip-relay/internal/config"
 	relayrtp "sip-relay/internal/rtp"
@@ -38,6 +39,7 @@ type Server struct {
 	srv       *sipgo.Server
 	listeners []net.Listener
 	udp       *net.UDPConn
+	callLog   *calllog.Clients
 
 	mu      sync.Mutex
 	byTag   map[string]*entry
@@ -73,6 +75,18 @@ func NewServer(cfg *config.Config, log *slog.Logger) *Server {
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	// Best-effort: call recording/logging is not on the media path, so a
+	// broken GCS/Pub-Sub config or a transient dial failure here must not
+	// stop the relay from serving calls. Building this once at startup
+	// (rather than per call, as before) avoids a fresh client dial+auth on
+	// every single call teardown.
+	callLog, err := calllog.NewClients(ctx, s.cfg)
+	if err != nil {
+		s.log.Error("failed to create call log/recording clients; recording and call logs are disabled", "error", err)
+	} else {
+		s.callLog = callLog
+	}
+
 	ua, err := sipgo.NewUA(
 		sipgo.WithUserAgent(s.cfg.SIP.UserAgent),
 		sipgo.WithUserAgentIP(net.ParseIP(s.cfg.SIP.AdvertisedIP)),
@@ -175,6 +189,7 @@ func (s *Server) Close() {
 	if s.ua != nil {
 		s.ua.Close()
 	}
+	s.callLog.Close()
 }
 
 func (s *Server) onOptions(log *slog.Logger, req *sipmsg.Request, tx sipmsg.ServerTransaction) {
@@ -256,7 +271,7 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		DNIS:    extension,
 		Headers: headers(req),
 	}
-	c := call.New(sessionID, metadata, s.cfg, mediaBackend, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension, "backend", route.Backend))
+	c := call.New(sessionID, metadata, s.cfg, mediaBackend, s.callLog, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension, "backend", route.Backend))
 	e := &entry{
 		localTag: localTag,
 		callID:   callID,

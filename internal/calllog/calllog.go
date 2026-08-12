@@ -69,8 +69,8 @@ func (r *Recorder) Close() error {
 	return r.closeLocked()
 }
 
-func (r *Recorder) Upload(ctx context.Context, cfg *config.Config, backendName, callID string) (string, error) {
-	if r == nil || cfg == nil || cfg.CallLog.RecordingBucket == "" {
+func (r *Recorder) Upload(ctx context.Context, clients *Clients, backendName, callID string) (string, error) {
+	if r == nil || clients == nil || clients.storage == nil {
 		return "", nil
 	}
 
@@ -83,14 +83,8 @@ func (r *Recorder) Upload(ctx context.Context, cfg *config.Config, backendName, 
 		return "", err
 	}
 
-	client, err := storage.NewClient(ctx, clientOptions(cfg.CallLog.CredentialsFile)...)
-	if err != nil {
-		return "", err
-	}
-	defer client.Close()
-
 	objectName := RecordingObjectName(backendName, callID)
-	writer := client.Bucket(cfg.CallLog.RecordingBucket).Object(objectName).NewWriter(ctx)
+	writer := clients.storage.Bucket(clients.bucket).Object(objectName).NewWriter(ctx)
 	writer.ContentType = uploadContentType
 	if _, err := io.Copy(writer, r.file); err != nil {
 		_ = writer.Close()
@@ -99,7 +93,7 @@ func (r *Recorder) Upload(ctx context.Context, cfg *config.Config, backendName, 
 	if err := writer.Close(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("gs://%s/%s", cfg.CallLog.RecordingBucket, objectName), nil
+	return fmt.Sprintf("gs://%s/%s", clients.bucket, objectName), nil
 }
 
 func (r *Recorder) Remove() error {
@@ -113,26 +107,72 @@ func (r *Recorder) Remove() error {
 	return os.Remove(r.path)
 }
 
-func Publish(ctx context.Context, cfg *config.Config, entry Entry) error {
-	if cfg == nil || cfg.CallLog.PubSubTopicID == "" {
+// Clients holds the GCS and Pub/Sub clients shared by every call for the
+// life of the process. Building these involves a real dial+auth handshake,
+// so they're created once at startup (NewClients) instead of per call.
+type Clients struct {
+	bucket  string
+	storage *storage.Client
+
+	pubsubClient *pubsub.Client
+	publisher    *pubsub.Publisher
+}
+
+// NewClients builds the shared upload/publish clients described by cfg.
+// A client is only created for the services actually configured (a nil
+// RecordingBucket or PubSubTopicID leaves the corresponding field nil, and
+// the matching Upload/Publish call becomes a no-op).
+func NewClients(ctx context.Context, cfg *config.Config) (*Clients, error) {
+	c := &Clients{bucket: cfg.CallLog.RecordingBucket}
+
+	if cfg.CallLog.RecordingBucket != "" {
+		client, err := storage.NewClient(ctx, clientOptions(cfg.CallLog.CredentialsFile)...)
+		if err != nil {
+			return nil, fmt.Errorf("create storage client: %w", err)
+		}
+		c.storage = client
+	}
+
+	if cfg.CallLog.PubSubTopicID != "" {
+		client, err := pubsub.NewClient(ctx, cfg.CallLog.PubSubProjectID, clientOptions(cfg.CallLog.CredentialsFile)...)
+		if err != nil {
+			if c.storage != nil {
+				_ = c.storage.Close()
+			}
+			return nil, fmt.Errorf("create pubsub client: %w", err)
+		}
+		c.pubsubClient = client
+		c.publisher = client.Publisher(cfg.CallLog.PubSubTopicID)
+	}
+
+	return c, nil
+}
+
+// Close releases the shared clients. Safe to call on a nil *Clients.
+func (c *Clients) Close() {
+	if c == nil {
+		return
+	}
+	if c.publisher != nil {
+		c.publisher.Stop()
+	}
+	if c.pubsubClient != nil {
+		_ = c.pubsubClient.Close()
+	}
+	if c.storage != nil {
+		_ = c.storage.Close()
+	}
+}
+
+func (c *Clients) Publish(ctx context.Context, entry Entry) error {
+	if c == nil || c.publisher == nil {
 		return nil
 	}
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
-
-	client, err := pubsub.NewClient(ctx, cfg.CallLog.PubSubProjectID, clientOptions(cfg.CallLog.CredentialsFile)...)
-	if err != nil {
-		return err
-	}
-	defer client.Close()
-
-	publisher := client.Publisher(cfg.CallLog.PubSubTopicID)
-	defer publisher.Stop()
-	result := publisher.Publish(ctx, &pubsub.Message{
-		Data: data,
-	})
+	result := c.publisher.Publish(ctx, &pubsub.Message{Data: data})
 	_, err = result.Get(ctx)
 	return err
 }

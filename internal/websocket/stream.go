@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	gorillaws "github.com/gorilla/websocket"
 
+	"sip-relay/internal/audio"
 	"sip-relay/internal/backend"
 	"sip-relay/internal/config"
 )
@@ -99,6 +100,13 @@ type stream struct {
 	log    *slog.Logger
 	once   sync.Once
 	mu     sync.Mutex
+
+	// inputTranscoder and outputTranscoder are nil unless the matching
+	// websocket.transcode direction is enabled, in which case audio flows
+	// through them at the point it crosses the WebSocket boundary; PCMU
+	// 8kHz bytes are all either side of this package ever sees or sends.
+	inputTranscoder  *audio.InputTranscoder
+	outputTranscoder *audio.OutputTranscoder
 }
 
 func connect(ctx context.Context, conf config.WebSocketConfig, sessionID string, log *slog.Logger) (*stream, error) {
@@ -163,13 +171,20 @@ func connect(ctx context.Context, conf config.WebSocketConfig, sessionID string,
 		conn:   conn,
 		log:    log,
 	}
+	if conf.Transcode.Input.Enabled {
+		out.inputTranscoder = audio.NewInputTranscoder(conf.Transcode.Input.SampleRate)
+	}
+	if conf.Transcode.Output.Enabled {
+		out.outputTranscoder = audio.NewOutputTranscoder(conf.Transcode.Output.SampleRate)
+	}
 	go out.sendLoop(streamCtx)
 	go out.recvLoop(streamCtx)
 	go func() {
 		<-streamCtx.Done()
 		_ = conn.Close()
 	}()
-	log.Info("telephony WebSocket ready", "session_id", sessionID)
+	log.Info("telephony WebSocket ready", "session_id", sessionID,
+		"transcode_input", conf.Transcode.Input.Enabled, "transcode_output", conf.Transcode.Output.Enabled)
 	return out, nil
 }
 
@@ -203,7 +218,15 @@ func (s *stream) sendLoop(ctx context.Context) {
 			if len(payload) == 0 {
 				continue
 			}
-			data := append([]byte(nil), payload...)
+			var data []byte
+			if s.inputTranscoder != nil {
+				data = s.inputTranscoder.Transcode(payload)
+				if len(data) == 0 {
+					continue
+				}
+			} else {
+				data = append([]byte(nil), payload...)
+			}
 			s.mu.Lock()
 			_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			err := s.conn.WriteMessage(gorillaws.BinaryMessage, data)
@@ -225,7 +248,16 @@ func (s *stream) recvLoop(ctx context.Context) {
 		}
 		switch messageType {
 		case gorillaws.BinaryMessage:
-			if !s.emit(ctx, backend.Event{Type: backend.EventAudio, Audio: append([]byte(nil), data...)}) {
+			var audioBytes []byte
+			if s.outputTranscoder != nil {
+				audioBytes = s.outputTranscoder.Transcode(data)
+				if len(audioBytes) == 0 {
+					continue
+				}
+			} else {
+				audioBytes = append([]byte(nil), data...)
+			}
+			if !s.emit(ctx, backend.Event{Type: backend.EventAudio, Audio: audioBytes}) {
 				return
 			}
 		case gorillaws.TextMessage:

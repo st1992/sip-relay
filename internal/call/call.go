@@ -15,10 +15,7 @@ import (
 	relayrtp "sip-relay/internal/rtp"
 )
 
-const (
-	finalizationTimeout = 2 * time.Minute
-	pcmuSilenceByte     = 0xff
-)
+const finalizationTimeout = 2 * time.Minute
 
 type Metadata struct {
 	CallID  string
@@ -43,6 +40,7 @@ type Call struct {
 	RTP      *relayrtp.Port
 	Config   *config.Config
 	Backend  backend.Dialer
+	CallLog  *calllog.Clients
 	Log      *slog.Logger
 	done     chan struct{}
 	mu       sync.Mutex
@@ -53,7 +51,7 @@ type Call struct {
 	doneOnce sync.Once
 }
 
-func New(id string, metadata Metadata, cfg *config.Config, dialer backend.Dialer, port *relayrtp.Port, log *slog.Logger) *Call {
+func New(id string, metadata Metadata, cfg *config.Config, dialer backend.Dialer, callLog *calllog.Clients, port *relayrtp.Port, log *slog.Logger) *Call {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -63,6 +61,7 @@ func New(id string, metadata Metadata, cfg *config.Config, dialer backend.Dialer
 		RTP:      port,
 		Config:   cfg,
 		Backend:  dialer,
+		CallLog:  callLog,
 		Log:      log,
 		done:     make(chan struct{}),
 	}
@@ -178,6 +177,7 @@ func (c *Call) run(ctx context.Context) {
 			"backend_silence_chunks_sent", snapshot.silenceChunksSent,
 			"backend_audio_events", snapshot.cesAudioEvents,
 			"backend_audio_bytes", snapshot.cesAudioBytes,
+			"outbound_audio_bytes_dropped", snapshot.outboundAudioBytesDropped,
 		)
 	}()
 
@@ -220,7 +220,7 @@ func (c *Call) run(ctx context.Context) {
 func (c *Call) sendRTPToBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
 	silence := make([]byte, relayrtp.SamplesPerFrame)
 	for i := range silence {
-		silence[i] = pcmuSilenceByte
+		silence[i] = relayrtp.SilenceByte
 	}
 
 	ticker := time.NewTicker(relayrtp.FrameDuration)
@@ -287,39 +287,42 @@ func audioDuration(bytes int) time.Duration {
 }
 
 type mediaStats struct {
-	inboundPackets    atomic.Uint64
-	inboundBytes      atomic.Uint64
-	cesChunksSent     atomic.Uint64
-	cesBytesSent      atomic.Uint64
-	silenceChunksSent atomic.Uint64
-	cesAudioEvents    atomic.Uint64
-	cesAudioBytes     atomic.Uint64
+	inboundPackets            atomic.Uint64
+	inboundBytes              atomic.Uint64
+	cesChunksSent             atomic.Uint64
+	cesBytesSent              atomic.Uint64
+	silenceChunksSent         atomic.Uint64
+	cesAudioEvents            atomic.Uint64
+	cesAudioBytes             atomic.Uint64
+	outboundAudioBytesDropped atomic.Uint64
 }
 
 type mediaStatsSnapshot struct {
-	inboundPackets    uint64
-	inboundBytes      uint64
-	cesChunksSent     uint64
-	cesBytesSent      uint64
-	silenceChunksSent uint64
-	cesAudioEvents    uint64
-	cesAudioBytes     uint64
+	inboundPackets            uint64
+	inboundBytes              uint64
+	cesChunksSent             uint64
+	cesBytesSent              uint64
+	silenceChunksSent         uint64
+	cesAudioEvents            uint64
+	cesAudioBytes             uint64
+	outboundAudioBytesDropped uint64
 }
 
 func (s *mediaStats) snapshot() mediaStatsSnapshot {
 	return mediaStatsSnapshot{
-		inboundPackets:    s.inboundPackets.Load(),
-		inboundBytes:      s.inboundBytes.Load(),
-		cesChunksSent:     s.cesChunksSent.Load(),
-		cesBytesSent:      s.cesBytesSent.Load(),
-		silenceChunksSent: s.silenceChunksSent.Load(),
-		cesAudioEvents:    s.cesAudioEvents.Load(),
-		cesAudioBytes:     s.cesAudioBytes.Load(),
+		inboundPackets:            s.inboundPackets.Load(),
+		inboundBytes:              s.inboundBytes.Load(),
+		cesChunksSent:             s.cesChunksSent.Load(),
+		cesBytesSent:              s.cesBytesSent.Load(),
+		silenceChunksSent:         s.silenceChunksSent.Load(),
+		cesAudioEvents:            s.cesAudioEvents.Load(),
+		cesAudioBytes:             s.cesAudioBytes.Load(),
+		outboundAudioBytesDropped: s.outboundAudioBytesDropped.Load(),
 	}
 }
 
 func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
-	outboundRTP := newOutboundRTPWriter(ctx, c.RTP, c.Log)
+	outboundRTP := newOutboundRTPWriter(ctx, c.RTP, c.Log, stats)
 	for {
 		select {
 		case <-ctx.Done():
@@ -367,6 +370,13 @@ func (c *Call) receiveBackend(ctx context.Context, stream backend.Stream, record
 	}
 }
 
+// maxQueuedOutboundBytes bounds how much backend audio can sit buffered,
+// waiting to be paced out to the caller. It's sized generously (30s of
+// PCMU) to absorb a legitimately bursty backend that streams a whole
+// utterance faster than real-time; only a backend that persistently
+// produces audio faster than the call can play it back will ever hit it.
+const maxQueuedOutboundBytes = 30 * relayrtp.SampleRate
+
 type outboundRTPCommand struct {
 	audio     []byte
 	interrupt bool
@@ -376,15 +386,22 @@ type outboundRTPWriter struct {
 	ctx      context.Context
 	port     *relayrtp.Port
 	log      *slog.Logger
+	stats    *mediaStats
 	commands chan outboundRTPCommand
 	write    chan []byte
+
+	// queuedBytes and overCap are only ever touched from the manage()
+	// goroutine, so they need no synchronization of their own.
+	queuedBytes int
+	overCap     bool
 }
 
-func newOutboundRTPWriter(ctx context.Context, port *relayrtp.Port, log *slog.Logger) *outboundRTPWriter {
+func newOutboundRTPWriter(ctx context.Context, port *relayrtp.Port, log *slog.Logger, stats *mediaStats) *outboundRTPWriter {
 	writer := &outboundRTPWriter{
 		ctx:      ctx,
 		port:     port,
 		log:      log,
+		stats:    stats,
 		commands: make(chan outboundRTPCommand),
 		write:    make(chan []byte),
 	}
@@ -439,6 +456,7 @@ func (w *outboundRTPWriter) manage() {
 		case cmd := <-w.commands:
 			queue = w.handleCommand(queue, cmd)
 		case w.write <- queue[0]:
+			w.queuedBytes -= len(queue[0])
 			queue[0] = nil
 			queue = queue[1:]
 		}
@@ -451,16 +469,53 @@ func (w *outboundRTPWriter) handleCommand(queue [][]byte, cmd outboundRTPCommand
 		for i := range queue {
 			queue[i] = nil
 		}
+		w.queuedBytes = 0
+		w.overCap = false
 		return queue[:0]
 	}
 	if len(cmd.audio) == 0 {
 		return queue
 	}
+	if w.queuedBytes+len(cmd.audio) > maxQueuedOutboundBytes {
+		if !w.overCap {
+			w.overCap = true
+			w.log.Warn("dropping backend audio: outbound RTP queue exceeded its cap",
+				"queued_bytes", w.queuedBytes, "cap_bytes", maxQueuedOutboundBytes)
+		}
+		if w.stats != nil {
+			w.stats.outboundAudioBytesDropped.Add(uint64(len(cmd.audio)))
+		}
+		return queue
+	}
+	w.overCap = false
+	w.queuedBytes += len(cmd.audio)
 	return append(queue, cmd.audio)
 }
 
+// writeLoop drains queued backend audio onto the RTP port. Real audio always
+// takes priority; when none is queued, it pads the outbound stream with
+// silence at the same 20ms cadence so the RTP stream to the caller stays
+// continuous instead of going quiet whenever the backend falls behind
+// real-time (network jitter, TTS generation pauses). Port.WritePayload and
+// Port.WriteSilenceFrame share the same internal pacer, so cadence stays
+// correct regardless of which one is called.
 func (w *outboundRTPWriter) writeLoop() {
+	ticker := time.NewTicker(relayrtp.FrameDuration)
+	defer ticker.Stop()
+
 	for {
+		select {
+		case audio, ok := <-w.write:
+			if !ok {
+				return
+			}
+			if err := w.port.WritePayload(audio); err != nil {
+				w.log.Warn("failed to write RTP audio", "error", err)
+			}
+			continue
+		default:
+		}
+
 		select {
 		case <-w.ctx.Done():
 			return
@@ -470,6 +525,10 @@ func (w *outboundRTPWriter) writeLoop() {
 			}
 			if err := w.port.WritePayload(audio); err != nil {
 				w.log.Warn("failed to write RTP audio", "error", err)
+			}
+		case <-ticker.C:
+			if err := w.port.WriteSilenceFrame(); err != nil {
+				w.log.Warn("failed to write RTP silence", "error", err)
 			}
 		}
 	}
@@ -536,7 +595,7 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 	ctx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 	defer cancel()
 	if recorder != nil {
-		if uri, err := recorder.Upload(ctx, c.Config, c.Backend.Name(), c.logCallID()); err != nil {
+		if uri, err := recorder.Upload(ctx, c.CallLog, c.Backend.Name(), c.logCallID()); err != nil {
 			c.Log.Error("failed to upload call recording", "error", err)
 		} else if uri != "" {
 			c.Log.Info("uploaded call recording", "uri", uri)
@@ -545,7 +604,7 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 			c.Log.Warn("failed to remove temporary call recording", "error", err)
 		}
 	}
-	if err := calllog.Publish(ctx, c.Config, calllog.Entry{
+	if err := c.CallLog.Publish(ctx, calllog.Entry{
 		Backend:        c.Backend.Name(),
 		Provider:       c.Backend.Metadata(),
 		ConversationID: c.ID,

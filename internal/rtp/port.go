@@ -24,7 +24,20 @@ const (
 	FramesPerSec    = int(time.Second / FrameDuration)
 	SamplesPerFrame = SampleRate / FramesPerSec
 	mtuSize         = 1500
+
+	// SilenceByte is the PCMU (G.711 mu-law) encoding of a zero-amplitude sample.
+	SilenceByte = 0xff
 )
+
+var silenceFrame = newSilenceFrame()
+
+func newSilenceFrame() []byte {
+	b := make([]byte, SamplesPerFrame)
+	for i := range b {
+		b[i] = SilenceByte
+	}
+	return b
+}
 
 type Config struct {
 	ListenIP            string
@@ -51,12 +64,13 @@ type Port struct {
 	remote       atomic.Pointer[net.UDPAddr]
 	closed       atomic.Bool
 
-	writeMu sync.Mutex
-	seq     uint16
-	ts      uint32
-	ssrc    uint32
-	nextAt  time.Time
-	paceSeq uint64
+	writeMu   sync.Mutex
+	seq       uint16
+	ts        uint32
+	ssrc      uint32
+	nextAt    time.Time
+	paceSeq   uint64
+	talkspurt bool
 
 	interruptMu  sync.Mutex
 	interruptCh  chan struct{}
@@ -173,7 +187,7 @@ func (p *Port) Run(ctx context.Context) error {
 }
 
 func (p *Port) WritePayload(payload []byte) error {
-	if len(payload) == 0 {
+	if p == nil || len(payload) == 0 {
 		return nil
 	}
 	interruptSeq := p.interruptSeq.Load()
@@ -185,22 +199,45 @@ func (p *Port) WritePayload(payload []byte) error {
 		if p.outboundInterrupted(interruptSeq) {
 			return nil
 		}
-		if p.paceSeq != interruptSeq {
-			p.nextAt = time.Time{}
-			p.paceSeq = interruptSeq
-		}
 		n := len(payload)
 		if n > p.packetBytes {
 			n = p.packetBytes
 		}
-		if err := p.writePacketLocked(payload[:n], interruptSeq); err != nil {
+		marker := !p.talkspurt
+		if err := p.writePacketLocked(payload[:n], interruptSeq, marker); err != nil {
 			if errors.Is(err, errOutboundInterrupted) {
 				return nil
 			}
 			return err
 		}
+		p.talkspurt = true
 		payload = payload[n:]
 	}
+	return nil
+}
+
+// WriteSilenceFrame sends one paced frame of PCMU silence. The outbound RTP
+// writer calls this whenever no real backend audio is available so the RTP
+// stream to the caller never goes quiet for a whole packet interval: gaps in
+// backend delivery (network jitter, TTS generation pauses) would otherwise
+// starve the pacer in WritePayload and produce audible dead air instead of a
+// continuous, smooth stream.
+func (p *Port) WriteSilenceFrame() error {
+	if p == nil {
+		return nil
+	}
+	interruptSeq := p.interruptSeq.Load()
+
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	if err := p.writePacketLocked(silenceFrame, interruptSeq, false); err != nil {
+		if errors.Is(err, errOutboundInterrupted) {
+			return nil
+		}
+		return err
+	}
+	p.talkspurt = false
 	return nil
 }
 
@@ -262,10 +299,15 @@ func (p *Port) readLoop() error {
 
 var errOutboundInterrupted = errors.New("outbound RTP interrupted")
 
-func (p *Port) writePacketLocked(payload []byte, interruptSeq uint64) error {
+func (p *Port) writePacketLocked(payload []byte, interruptSeq uint64, marker bool) error {
 	remote := p.remote.Load()
 	if remote == nil {
 		return nil
+	}
+
+	if p.paceSeq != interruptSeq {
+		p.nextAt = time.Time{}
+		p.paceSeq = interruptSeq
 	}
 
 	if p.packetEvery > 0 {
@@ -286,6 +328,7 @@ func (p *Port) writePacketLocked(payload []byte, interruptSeq uint64) error {
 		SequenceNumber: p.seq,
 		Timestamp:      p.ts,
 		SSRC:           p.ssrc,
+		Marker:         marker,
 	}
 	p.seq++
 	p.ts += uint32(len(payload))

@@ -29,6 +29,15 @@ websocket:
   session_timeout: 15s
   connect_timeout: 15s
   max_message_bytes: 4194304
+  # Opt-in PCM transcoding for this backend only. Disabled by default -- audio
+  # flows as raw PCMU 8kHz bytes unchanged, matching current behavior.
+  transcode:
+    input:                # caller -> backend (PCMU 8kHz mu-law -> PCM16LE)
+      enabled: false
+      sample_rate: 16000
+    output:                # backend -> caller (PCM16LE -> PCMU 8kHz mu-law)
+      enabled: false
+      sample_rate: 24000
 
 extensions:
   "1014":

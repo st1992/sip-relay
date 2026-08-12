@@ -242,6 +242,98 @@ func TestPortInterruptsOutboundWritePayload(t *testing.T) {
 	}
 }
 
+func TestPortSetsMarkerOnTalkspurtStartOnly(t *testing.T) {
+	port, err := Listen(Config{
+		ListenIP:            "127.0.0.1",
+		PayloadType:         0,
+		OutboundPacketBytes: 3,
+		MediaTimeoutInitial: time.Second,
+		MediaTimeout:        time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer port.Close()
+
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
+
+	if err := port.WritePayload([]byte{1, 2, 3, 4, 5, 6}); err != nil {
+		t.Fatal(err)
+	}
+	first := readPacket(t, peer)
+	second := readPacket(t, peer)
+	if !first.Marker {
+		t.Fatal("first packet of a talkspurt should set the marker bit")
+	}
+	if second.Marker {
+		t.Fatal("second packet of the same talkspurt should not set the marker bit")
+	}
+
+	if err := port.WriteSilenceFrame(); err != nil {
+		t.Fatal(err)
+	}
+	silence := readPacket(t, peer)
+	if silence.Marker {
+		t.Fatal("injected silence frame should not set the marker bit")
+	}
+
+	if err := port.WritePayload([]byte{7, 8, 9}); err != nil {
+		t.Fatal(err)
+	}
+	resumed := readPacket(t, peer)
+	if !resumed.Marker {
+		t.Fatal("first real packet after silence should set the marker bit")
+	}
+}
+
+func TestPortWriteSilenceFrameSendsSilencePayload(t *testing.T) {
+	port, err := Listen(Config{
+		ListenIP:            "127.0.0.1",
+		PayloadType:         0,
+		MediaTimeoutInitial: time.Second,
+		MediaTimeout:        time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer port.Close()
+
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
+
+	if err := port.WriteSilenceFrame(); err != nil {
+		t.Fatal(err)
+	}
+	pkt := readPacket(t, peer)
+	if len(pkt.Payload) != SamplesPerFrame {
+		t.Fatalf("silence payload length = %d, want %d", len(pkt.Payload), SamplesPerFrame)
+	}
+	for i, b := range pkt.Payload {
+		if b != SilenceByte {
+			t.Fatalf("silence payload[%d] = %#x, want %#x", i, b, SilenceByte)
+		}
+	}
+}
+
+func TestPortWriteMethodsToleratesNilReceiver(t *testing.T) {
+	var port *Port
+	if err := port.WritePayload([]byte{1, 2, 3}); err != nil {
+		t.Fatalf("WritePayload on nil port = %v, want nil", err)
+	}
+	if err := port.WriteSilenceFrame(); err != nil {
+		t.Fatalf("WriteSilenceFrame on nil port = %v, want nil", err)
+	}
+}
+
 func TestListenUsesEvenRTPPortAndSkipsBusyPorts(t *testing.T) {
 	minPort, maxPort, blocker := reserveEvenPairRange(t)
 	defer blocker.Close()

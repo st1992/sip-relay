@@ -56,10 +56,24 @@ type CESConfig struct {
 }
 
 type WebSocketConfig struct {
-	BaseURL         string        `yaml:"base_url"`
-	SessionTimeout  time.Duration `yaml:"session_timeout"`
-	ConnectTimeout  time.Duration `yaml:"connect_timeout"`
-	MaxMessageBytes int64         `yaml:"max_message_bytes"`
+	BaseURL         string          `yaml:"base_url"`
+	SessionTimeout  time.Duration   `yaml:"session_timeout"`
+	ConnectTimeout  time.Duration   `yaml:"connect_timeout"`
+	MaxMessageBytes int64           `yaml:"max_message_bytes"`
+	Transcode       TranscodeConfig `yaml:"transcode"`
+}
+
+// TranscodeConfig controls optional PCM transcoding for the WebSocket
+// backend only. Both directions default disabled: audio flows as raw PCMU
+// 8kHz bytes unchanged unless a direction is explicitly enabled.
+type TranscodeConfig struct {
+	Input  TranscodeDirectionConfig `yaml:"input"`  // caller -> backend
+	Output TranscodeDirectionConfig `yaml:"output"` // backend -> caller
+}
+
+type TranscodeDirectionConfig struct {
+	Enabled    bool `yaml:"enabled"`
+	SampleRate int  `yaml:"sample_rate"`
 }
 
 type ExtensionConfig struct {
@@ -119,6 +133,10 @@ func Default() *Config {
 			SessionTimeout:  15 * time.Second,
 			ConnectTimeout:  15 * time.Second,
 			MaxMessageBytes: 4 << 20,
+			Transcode: TranscodeConfig{
+				Input:  TranscodeDirectionConfig{Enabled: false, SampleRate: 16000},
+				Output: TranscodeDirectionConfig{Enabled: false, SampleRate: 24000},
+			},
 		},
 	}
 }
@@ -201,6 +219,23 @@ func (c WebSocketConfig) Validate() error {
 	}
 	if c.MaxMessageBytes <= 0 {
 		return fmt.Errorf("websocket.max_message_bytes must be positive")
+	}
+	return c.Transcode.Validate()
+}
+
+func (c TranscodeConfig) Validate() error {
+	if err := c.Input.validate("websocket.transcode.input"); err != nil {
+		return err
+	}
+	return c.Output.validate("websocket.transcode.output")
+}
+
+func (c TranscodeDirectionConfig) validate(field string) error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.SampleRate <= 0 {
+		return fmt.Errorf("%s.sample_rate must be positive", field)
 	}
 	return nil
 }

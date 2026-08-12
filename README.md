@@ -2,7 +2,7 @@
 
 `sip-relay` accepts inbound SIP calls, negotiates PCMU/G.711 mu-law at 8000 Hz, and routes each extension to either Google CES over gRPC or an independent telephony WebSocket service.
 
-The media path intentionally does not decode, resample, mix, or transcode audio. It only parses RTP headers so it can extract and write packet payloads.
+The media path intentionally does not decode, resample, mix, or transcode audio. It only parses RTP headers so it can extract and write packet payloads. The one exception is optional, opt-in PCM transcoding on the WebSocket backend (see `websocket.transcode` below), for backends whose audio contract isn't PCMU/8000.
 
 ## Run
 
@@ -71,6 +71,23 @@ Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects
 
 - Incoming SDP must offer `PCMU/8000`.
 - CES routes send RTP payload bytes as gRPC `SessionInput.Audio` and packetize `SessionOutput.Audio` as outbound RTP.
-- WebSocket routes first POST `/api/v1/telephony/session`, then connect to `/api/v1/telephony/ws/{session_id}`. Inbound and outbound audio use binary frames containing raw PCMU bytes; text frames carry lifecycle, transcript, barge-in, and transfer events.
+- WebSocket routes first POST `/api/v1/telephony/session`, then connect to `/api/v1/telephony/ws/{session_id}`. By default, inbound and outbound audio use binary frames containing raw PCMU bytes; text frames carry lifecycle, transcript, barge-in, and transfer events.
 - A `barge_in` event flushes buffered outbound audio. A `transfer` event closes the backend and terminates the SIP dialog with BYE so external telephony infrastructure can perform the human-queue routing.
 - Outbound RTP timestamps advance by the number of PCMU payload bytes sent.
+
+### WebSocket PCM transcoding (optional)
+
+If a WebSocket backend expects raw 16-bit linear PCM instead of PCMU, enable transcoding per direction under `websocket.transcode` in the config:
+
+```yaml
+websocket:
+  transcode:
+    input:                # caller -> backend (PCMU 8kHz mu-law -> PCM16LE)
+      enabled: true
+      sample_rate: 16000
+    output:                # backend -> caller (PCM16LE -> PCMU 8kHz mu-law)
+      enabled: true
+      sample_rate: 24000
+```
+
+Both directions default to `enabled: false`, so existing deployments are unaffected unless they opt in. Transcoding happens entirely inside the WebSocket backend package (`internal/audio`, `internal/websocket`); everything else in the relay — RTP playout, recordings, call logs — always sees PCMU/8000 bytes, since that's the only codec the SIP/RTP side ever negotiates. Sample-rate conversion uses a pure-Go, dependency-free resampler (Lagrange interpolation with state kept across chunks, so audio stays smooth across arbitrarily sized WebSocket messages) — no cgo, no change to the container build.
