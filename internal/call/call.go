@@ -595,7 +595,7 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder) {
 	ctx, cancel := context.WithTimeout(context.Background(), finalizationTimeout)
 	defer cancel()
 	if recorder != nil {
-		if uri, err := recorder.Upload(ctx, c.CallLog, c.Backend.Name(), c.logCallID()); err != nil {
+		if uri, err := recorder.Upload(ctx, c.CallLog, c.Backend.Name(), c.ID); err != nil {
 			c.Log.Error("failed to upload call recording", "error", err)
 		} else if uri != "" {
 			c.Log.Info("uploaded call recording", "uri", uri)
@@ -629,11 +629,4 @@ func (c *Call) hangupReason() string {
 	default:
 		return "USER_ENDED"
 	}
-}
-
-func (c *Call) logCallID() string {
-	if c.Metadata.CallID != "" {
-		return c.Metadata.CallID
-	}
-	return c.ID
 }
