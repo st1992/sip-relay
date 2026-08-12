@@ -9,17 +9,17 @@ import (
 	"sip-relay/internal/config"
 )
 
-func TestRecordingObjectNameStoresUnderBackend(t *testing.T) {
-	got := RecordingObjectName("websocket", "call/123@example.com")
-	want := "websocket/call-123-example.com.ulaw"
+func TestRecordingObjectNameIsFlatInTheBucketRoot(t *testing.T) {
+	got := RecordingObjectName("call/123@example.com")
+	want := "call-123-example.com.ulaw"
 	if got != want {
 		t.Fatalf("RecordingObjectName() = %q, want %q", got, want)
 	}
 }
 
-func TestRecordingObjectNameFallsBackForEmptyParts(t *testing.T) {
-	got := RecordingObjectName("", "")
-	want := "unknown/unknown.ulaw"
+func TestRecordingObjectNameFallsBackForEmptyCallID(t *testing.T) {
+	got := RecordingObjectName("")
+	want := "unknown.ulaw"
 	if got != want {
 		t.Fatalf("RecordingObjectName() = %q, want %q", got, want)
 	}
@@ -43,7 +43,7 @@ func TestNewClientsSkipsUnconfiguredServices(t *testing.T) {
 		t.Fatalf("Publish() with no publisher = %v, want nil", err)
 	}
 	recorder := &Recorder{}
-	if uri, err := recorder.Upload(context.Background(), clients, "ces", "call-1"); err != nil || uri != "" {
+	if uri, err := recorder.Upload(context.Background(), clients, "call-1"); err != nil || uri != "" {
 		t.Fatalf("Upload() with no storage client = (%q, %v), want (\"\", nil)", uri, err)
 	}
 
@@ -60,7 +60,7 @@ func TestClientsPublishAndCloseToleratesNilReceiver(t *testing.T) {
 
 func TestRecorderUploadToleratesNilRecorder(t *testing.T) {
 	var recorder *Recorder
-	if uri, err := recorder.Upload(context.Background(), &Clients{}, "ces", "call-1"); err != nil || uri != "" {
+	if uri, err := recorder.Upload(context.Background(), &Clients{}, "call-1"); err != nil || uri != "" {
 		t.Fatalf("Upload() on nil *Recorder = (%q, %v), want (\"\", nil)", uri, err)
 	}
 }

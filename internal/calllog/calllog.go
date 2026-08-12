@@ -69,7 +69,7 @@ func (r *Recorder) Close() error {
 	return r.closeLocked()
 }
 
-func (r *Recorder) Upload(ctx context.Context, clients *Clients, backendName, callID string) (string, error) {
+func (r *Recorder) Upload(ctx context.Context, clients *Clients, callID string) (string, error) {
 	if r == nil || clients == nil || clients.storage == nil {
 		return "", nil
 	}
@@ -83,7 +83,7 @@ func (r *Recorder) Upload(ctx context.Context, clients *Clients, backendName, ca
 		return "", err
 	}
 
-	objectName := RecordingObjectName(backendName, callID)
+	objectName := RecordingObjectName(callID)
 	writer := clients.storage.Bucket(clients.bucket).Object(objectName).NewWriter(ctx)
 	writer.ContentType = uploadContentType
 	if _, err := io.Copy(writer, r.file); err != nil {
@@ -177,10 +177,11 @@ func (c *Clients) Publish(ctx context.Context, entry Entry) error {
 	return err
 }
 
-func RecordingObjectName(appID, callID string) string {
-	appPart := cleanObjectPart(appID)
-	callPart := cleanObjectPart(callID)
-	return appPart + "/" + callPart + ".ulaw"
+// RecordingObjectName returns the recording's object name, placed directly
+// in the bucket root (no per-backend subfolder) so it's <call_id>.ulaw for
+// every backend.
+func RecordingObjectName(callID string) string {
+	return cleanObjectPart(callID) + ".ulaw"
 }
 
 func (r *Recorder) closeLocked() error {

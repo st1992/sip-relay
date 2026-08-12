@@ -65,7 +65,7 @@ If your deployment needs explicit memory tuning, pass Go runtime settings such a
 
 Set `call_log.pubsub_topic_id` and `call_log.pubsub_project_id` to publish a JSON call log when a call ends. The message identifies the selected `backend`, includes optional provider metadata, the conversation ID, ANI, DNIS, timestamps, and hangup reason. Set `call_log.credentials_file` when call logging should use explicit Google credentials.
 
-Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects are stored as `<backend>/<call_id>.ulaw`.
+Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects are stored directly in the bucket root as `<call_id>.ulaw` (`call_id` is the session ID, matching `conversation_id` in the call log message), the same for every backend. Recordings are raw, headerless G.711 mu-law (mono, 8000 Hz) -- play with e.g. `ffplay -f mulaw -ar 8000 -ac 1 <file>` or convert with `ffmpeg -f mulaw -ar 8000 -ac 1 -i <file> out.wav`. Both call legs are written to the same file, interleaved in real-time arrival order (not a separate-channel/stereo recording).
 
 ## SIP/Media Contract
 
