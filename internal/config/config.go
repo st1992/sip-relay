@@ -15,13 +15,17 @@ import (
 const (
 	BackendCES       = "ces"
 	BackendWebSocket = "websocket"
+
+	// DefaultProfile is the implicit ces/websocket profile name used by an
+	// extension that omits `profile:`.
+	DefaultProfile = "default"
 )
 
 type Config struct {
 	SIP        SIPConfig                  `yaml:"sip"`
 	RTP        RTPConfig                  `yaml:"rtp"`
-	CES        CESConfig                  `yaml:"ces"`
-	WebSocket  WebSocketConfig            `yaml:"websocket"`
+	CES        map[string]CESConfig       `yaml:"ces"`
+	WebSocket  map[string]WebSocketConfig `yaml:"websocket"`
 	Extensions map[string]ExtensionConfig `yaml:"extensions"`
 	CallLog    CallLogConfig              `yaml:"call_log"`
 }
@@ -78,6 +82,18 @@ type TranscodeDirectionConfig struct {
 
 type ExtensionConfig struct {
 	Backend string `yaml:"backend"`
+	// Profile selects which named ces/websocket config this extension uses.
+	// Empty means DefaultProfile.
+	Profile string `yaml:"profile"`
+}
+
+// ResolveProfile returns the effective ces/websocket profile name for a
+// route, applying the DefaultProfile fallback when Profile is unset.
+func ResolveProfile(route ExtensionConfig) string {
+	if route.Profile == "" {
+		return DefaultProfile
+	}
+	return route.Profile
 }
 
 type CallLogConfig struct {
@@ -102,10 +118,48 @@ func Load(path string) (*Config, error) {
 	if err := decoder.Decode(cfg); err != nil {
 		return nil, err
 	}
+	for name, ces := range cfg.CES {
+		applyCESDefaults(&ces)
+		cfg.CES[name] = ces
+	}
+	for name, ws := range cfg.WebSocket {
+		applyWebSocketDefaults(&ws)
+		cfg.WebSocket[name] = ws
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func applyCESDefaults(c *CESConfig) {
+	if c.Location == "" {
+		c.Location = "us"
+	}
+	if c.Endpoint == "" {
+		c.Endpoint = "ces.googleapis.com:443"
+	}
+	if c.SessionPrefix == "" {
+		c.SessionPrefix = "sip"
+	}
+}
+
+func applyWebSocketDefaults(c *WebSocketConfig) {
+	if c.SessionTimeout == 0 {
+		c.SessionTimeout = 15 * time.Second
+	}
+	if c.ConnectTimeout == 0 {
+		c.ConnectTimeout = 15 * time.Second
+	}
+	if c.MaxMessageBytes == 0 {
+		c.MaxMessageBytes = 4 << 20
+	}
+	if c.Transcode.Input.SampleRate == 0 {
+		c.Transcode.Input.SampleRate = 16000
+	}
+	if c.Transcode.Output.SampleRate == 0 {
+		c.Transcode.Output.SampleRate = 24000
+	}
 }
 
 func Default() *Config {
@@ -123,20 +177,6 @@ func Default() *Config {
 			SymmetricRTP:        true,
 			MediaTimeoutInitial: 30 * time.Second,
 			MediaTimeout:        15 * time.Second,
-		},
-		CES: CESConfig{
-			Location:      "us",
-			Endpoint:      "ces.googleapis.com:443",
-			SessionPrefix: "sip",
-		},
-		WebSocket: WebSocketConfig{
-			SessionTimeout:  15 * time.Second,
-			ConnectTimeout:  15 * time.Second,
-			MaxMessageBytes: 4 << 20,
-			Transcode: TranscodeConfig{
-				Input:  TranscodeDirectionConfig{Enabled: false, SampleRate: 16000},
-				Output: TranscodeDirectionConfig{Enabled: false, SampleRate: 24000},
-			},
 		},
 	}
 }
@@ -160,28 +200,30 @@ func (c *Config) Validate() error {
 	if len(c.Extensions) == 0 {
 		return fmt.Errorf("extensions must configure at least one extension")
 	}
-	usesCES, usesWebSocket := false, false
 	for extension, route := range c.Extensions {
 		if extension == "" {
 			return fmt.Errorf("extensions key must not be empty")
 		}
+		profile := ResolveProfile(route)
 		switch route.Backend {
 		case BackendCES:
-			usesCES = true
+			cesCfg, ok := c.CES[profile]
+			if !ok {
+				return fmt.Errorf("extensions.%s: ces profile %q not defined", extension, profile)
+			}
+			if err := cesCfg.Validate(); err != nil {
+				return err
+			}
 		case BackendWebSocket:
-			usesWebSocket = true
+			wsCfg, ok := c.WebSocket[profile]
+			if !ok {
+				return fmt.Errorf("extensions.%s: websocket profile %q not defined", extension, profile)
+			}
+			if err := wsCfg.Validate(); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("extensions.%s.backend must be %q or %q", extension, BackendCES, BackendWebSocket)
-		}
-	}
-	if usesCES {
-		if err := c.CES.Validate(); err != nil {
-			return err
-		}
-	}
-	if usesWebSocket {
-		if err := c.WebSocket.Validate(); err != nil {
-			return err
 		}
 	}
 	if c.CallLog.PubSubTopicID != "" && c.CallLog.PubSubProjectID == "" {

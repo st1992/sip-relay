@@ -217,6 +217,7 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		respond(req, tx, 404, "Unknown extension", nil)
 		return
 	}
+	profile := config.ResolveProfile(route)
 	mediaBackend, sessionPrefix, err := backendForRoute(s.cfg, route)
 	if err != nil {
 		respond(req, tx, 500, "Invalid extension backend", nil)
@@ -270,8 +271,9 @@ func (s *Server) onInvite(log *slog.Logger, req *sipmsg.Request, tx sipmsg.Serve
 		ANI:     ani(req),
 		DNIS:    extension,
 		Headers: headers(req),
+		Profile: profile,
 	}
-	c := call.New(sessionID, metadata, s.cfg, mediaBackend, s.callLog, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension, "backend", route.Backend))
+	c := call.New(sessionID, metadata, s.cfg, mediaBackend, s.callLog, port, s.log.With("call_id", callID, "session_id", sessionID, "extension", extension, "backend", route.Backend, "profile", profile))
 	e := &entry{
 		localTag: localTag,
 		callID:   callID,
@@ -502,11 +504,20 @@ func (s *Server) contactHeader() string {
 }
 
 func backendForRoute(cfg *config.Config, route config.ExtensionConfig) (backend.Dialer, string, error) {
+	profile := config.ResolveProfile(route)
 	switch route.Backend {
 	case config.BackendCES:
-		return ces.Dialer{Config: cfg.CES}, cfg.CES.SessionPrefix, nil
+		cesCfg, ok := cfg.CES[profile]
+		if !ok {
+			return nil, "", fmt.Errorf("ces profile %q not configured", profile)
+		}
+		return ces.Dialer{Config: cesCfg}, cesCfg.SessionPrefix, nil
 	case config.BackendWebSocket:
-		return telephonyws.Dialer{Config: cfg.WebSocket}, "sip", nil
+		wsCfg, ok := cfg.WebSocket[profile]
+		if !ok {
+			return nil, "", fmt.Errorf("websocket profile %q not configured", profile)
+		}
+		return telephonyws.Dialer{Config: wsCfg}, "sip", nil
 	default:
 		return nil, "", fmt.Errorf("unsupported backend %q", route.Backend)
 	}

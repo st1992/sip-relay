@@ -24,6 +24,7 @@ var objectPartCleaner = regexp.MustCompile(`[^a-zA-Z0-9._=-]+`)
 
 type Entry struct {
 	Backend             string              `json:"backend"`
+	Profile             string              `json:"profile,omitempty"`
 	Provider            map[string]string   `json:"provider,omitempty"`
 	ConversationID      string              `json:"conversation_id"`
 	ANI                 string              `json:"ani"`

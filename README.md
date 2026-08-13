@@ -10,30 +10,47 @@ The media path intentionally does not decode, resample, mix, or transcode audio.
 go run ./cmd/sip-relay --config config.example.yaml
 ```
 
-Configure each number under the top-level `extensions` map:
+Configure each number under the top-level `extensions` map. `ces` and `websocket` are each a map of named *profiles* — an extension's optional `profile:` selects which one it uses, defaulting to `default` when omitted. This lets different extensions point at different CES projects or different WebSocket telephony services:
 
 ```yaml
 ces:
-  project_id: project
-  location: us
-  app_id: app
-  endpoint: ces.googleapis.com:443
-  credentials_file: /app/credentials.json
+  default:
+    project_id: project
+    location: us
+    app_id: app
+    endpoint: ces.googleapis.com:443
+    credentials_file: /app/credentials.json
+  secondary:
+    project_id: another-project
+    location: us
+    app_id: another-app
+    endpoint: ces.googleapis.com:443
 
 websocket:
-  base_url: http://telephony-service:8001
-  session_timeout: 15s
-  connect_timeout: 15s
+  default:
+    base_url: http://telephony-service:8001
+    session_timeout: 15s
+    connect_timeout: 15s
+  secondary:
+    base_url: http://other-telephony-service:8001
+    session_timeout: 15s
+    connect_timeout: 15s
 
 extensions:
   "1014":
-    backend: ces
+    backend: ces               # profile omitted -> "default"
   "1015":
+    backend: websocket          # profile omitted -> "default"
+  "1016":
+    backend: ces
+    profile: secondary
+  "1017":
     backend: websocket
+    profile: secondary
 ```
 
-CES is gRPC-only. Use application default credentials or set `ces.credentials_file` to a Google service account JSON file. The WebSocket backend does not use CES configuration or Google credentials.
-`websocket.base_url` must contain only the HTTP(S) origin; the relay appends the fixed telephony API paths.
+CES is gRPC-only. Each CES profile independently uses application default credentials or its own `credentials_file` pointing to a Google service account JSON file. The WebSocket backend does not use CES configuration or Google credentials.
+Each `<profile>.base_url` under `websocket` must contain only the HTTP(S) origin; the relay appends the fixed telephony API paths.
 
 ## Docker
 
@@ -63,7 +80,7 @@ If your deployment needs explicit memory tuning, pass Go runtime settings such a
 
 ## Call Logs And Recordings
 
-Set `call_log.pubsub_topic_id` and `call_log.pubsub_project_id` to publish a JSON call log when a call ends. The message identifies the selected `backend`, includes optional provider metadata, the conversation ID, ANI, DNIS, timestamps, and hangup reason. Set `call_log.credentials_file` when call logging should use explicit Google credentials.
+Set `call_log.pubsub_topic_id` and `call_log.pubsub_project_id` to publish a JSON call log when a call ends. The message identifies the selected `backend` and `profile`, includes optional provider metadata, the conversation ID, ANI, DNIS, timestamps, and hangup reason. Set `call_log.credentials_file` when call logging should use explicit Google credentials.
 
 Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects are stored directly in the bucket root as `<call_id>.ulaw` (`call_id` is the session ID, matching `conversation_id` in the call log message), the same for every backend. Recordings are raw, headerless G.711 mu-law (mono, 8000 Hz) -- play with e.g. `ffplay -f mulaw -ar 8000 -ac 1 <file>` or convert with `ffmpeg -f mulaw -ar 8000 -ac 1 -i <file> out.wav`. Both call legs are written to the same file, interleaved in real-time arrival order (not a separate-channel/stereo recording).
 
@@ -77,17 +94,18 @@ Set `call_log.recording_bucket` to upload raw `.ulaw` recordings to GCS. Objects
 
 ### WebSocket PCM transcoding (optional)
 
-If a WebSocket backend expects raw 16-bit linear PCM instead of PCMU, enable transcoding per direction under `websocket.transcode` in the config:
+If a WebSocket backend expects raw 16-bit linear PCM instead of PCMU, enable transcoding per direction under `websocket.<profile>.transcode` in the config:
 
 ```yaml
 websocket:
-  transcode:
-    input:                # caller -> backend (PCMU 8kHz mu-law -> PCM16LE)
-      enabled: true
-      sample_rate: 16000
-    output:                # backend -> caller (PCM16LE -> PCMU 8kHz mu-law)
-      enabled: true
-      sample_rate: 24000
+  default:
+    transcode:
+      input:                # caller -> backend (PCMU 8kHz mu-law -> PCM16LE)
+        enabled: true
+        sample_rate: 16000
+      output:                # backend -> caller (PCM16LE -> PCMU 8kHz mu-law)
+        enabled: true
+        sample_rate: 24000
 ```
 
 Both directions default to `enabled: false`, so existing deployments are unaffected unless they opt in. Transcoding happens entirely inside the WebSocket backend package (`internal/audio`, `internal/websocket`); everything else in the relay — RTP playout, recordings, call logs — always sees PCMU/8000 bytes, since that's the only codec the SIP/RTP side ever negotiates. Sample-rate conversion uses a pure-Go, dependency-free resampler (Lagrange interpolation with state kept across chunks, so audio stays smooth across arbitrarily sized WebSocket messages) — no cgo, no change to the container build.

@@ -23,6 +23,7 @@ type Metadata struct {
 	ANI     string
 	DNIS    string
 	Headers map[string][]string
+	Profile string
 }
 
 type EndReason string
@@ -726,6 +727,7 @@ func (c *Call) finish(startedAt time.Time, recorder *calllog.Recorder, history *
 	}
 	if err := c.CallLog.Publish(ctx, calllog.Entry{
 		Backend:             c.Backend.Name(),
+		Profile:             c.Metadata.Profile,
 		Provider:            c.Backend.Metadata(),
 		ConversationID:      c.ID,
 		ANI:                 c.Metadata.ANI,

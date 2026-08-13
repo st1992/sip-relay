@@ -1,7 +1,7 @@
 sip:
   listen_ip: 0.0.0.0
   listen_port: 5060
-  advertised_ip: 35.238.xx.xx
+  advertised_ip: 203.0.113.10 # placeholder (RFC 5737 TEST-NET-3) -- replace with your public IP
   user_agent: streamlink
 
 rtp:
@@ -12,42 +12,65 @@ rtp:
   media_timeout_initial: 30s
   media_timeout: 15s
 
+# ces and websocket are maps of named profiles. An extension picks a profile
+# via `profile:`; omitting it means the profile named "default". This lets
+# different extensions use different CES projects or different WebSocket
+# telephony services.
 ces:
-  project_id: div-deai-cx-dev-usc1-ri
-  location: us
-  app_id: 203a8f7e-7415-4d05-ac80-95617b3ad39b
-  deployment_id: dea554e4-5eeb-4cd6-88e2-1b0bb27eb250
-  endpoint: ces.googleapis.com:443
-  credentials_file: "/home/sumeet1/sip-relay/credentials.json"
-  session_prefix: sip
-  noise_suppression_level: ""
-  time_zone: ""
-  use_tool_fakes: false
+  default:
+    project_id: div-deai-cx-dev-usc1-ri
+    location: us
+    app_id: 203a8f7e-7415-4d05-ac80-95617b3ad39b
+    deployment_id: dea554e4-5eeb-4cd6-88e2-1b0bb27eb250
+    endpoint: ces.googleapis.com:443
+    credentials_file: "/home/sumeet1/sip-relay/credentials.json"
+    session_prefix: sip
+    noise_suppression_level: ""
+    time_zone: ""
+    use_tool_fakes: false
+  secondary:
+    project_id: div-deai-cx-dev-usc1-ri-2
+    location: us
+    app_id: 3a8fce15-0000-0000-0000-000000000000
+    endpoint: ces.googleapis.com:443
+    credentials_file: "/home/sumeet1/sip-relay/credentials.json"
+    session_prefix: sip
 
 websocket:
-  base_url: http://127.0.0.1:8001
-  session_timeout: 15s
-  connect_timeout: 15s
-  max_message_bytes: 4194304
-  # Opt-in PCM transcoding for this backend only. Disabled by default -- audio
-  # flows as raw PCMU 8kHz bytes unchanged, matching current behavior.
-  transcode:
-    input:                # caller -> backend (PCMU 8kHz mu-law -> PCM16LE)
-      enabled: false
-      sample_rate: 16000
-    output:                # backend -> caller (PCM16LE -> PCMU 8kHz mu-law)
-      enabled: false
-      sample_rate: 24000
+  default:
+    base_url: http://127.0.0.1:8001
+    session_timeout: 15s
+    connect_timeout: 15s
+    max_message_bytes: 4194304
+    # Opt-in PCM transcoding for this backend only. Disabled by default -- audio
+    # flows as raw PCMU 8kHz bytes unchanged, matching current behavior.
+    transcode:
+      input:                # caller -> backend (PCMU 8kHz mu-law -> PCM16LE)
+        enabled: false
+        sample_rate: 16000
+      output:                # backend -> caller (PCM16LE -> PCMU 8kHz mu-law)
+        enabled: false
+        sample_rate: 24000
+  secondary:
+    base_url: http://127.0.0.1:8002
+    session_timeout: 15s
+    connect_timeout: 15s
+    max_message_bytes: 4194304
 
 extensions:
   "1014":
-    backend: ces
+    backend: ces               # profile omitted -> "default"
   "1015":
+    backend: websocket          # profile omitted -> "default"
+  "1017":
     backend: websocket
+    profile: secondary
+  "1018":
+    backend: ces
+    profile: secondary
 
 call_log:
   pubsub_project_id: div-deai-cx-dev-usc1-ri
   pubsub_topic_id: cx-gecx-topic
   recording_bucket: ""
   credentials_file: "/home/sumeet1/sip-relay/credentials.json"
-

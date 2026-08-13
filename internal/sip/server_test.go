@@ -2,6 +2,7 @@ package sip
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	sipmsg "github.com/livekit/sipgo/sip"
@@ -135,7 +136,8 @@ func TestServerBYEUsesUASRouteSetAndFirstProxyDestination(t *testing.T) {
 
 func TestBackendForRouteSelectsIndependentBackend(t *testing.T) {
 	cfg := config.Default()
-	cfg.CES.SessionPrefix = "ces-prefix"
+	cfg.CES = map[string]config.CESConfig{"default": {SessionPrefix: "ces-prefix"}}
+	cfg.WebSocket = map[string]config.WebSocketConfig{"default": {}}
 
 	cesBackend, prefix, err := backendForRoute(cfg, config.ExtensionConfig{Backend: config.BackendCES})
 	if err != nil {
@@ -151,6 +153,32 @@ func TestBackendForRouteSelectsIndependentBackend(t *testing.T) {
 	}
 	if wsBackend.Name() != config.BackendWebSocket || prefix != "sip" {
 		t.Fatalf("WebSocket backend = %q, prefix = %q", wsBackend.Name(), prefix)
+	}
+}
+
+func TestBackendForRouteSelectsNamedProfile(t *testing.T) {
+	cfg := config.Default()
+	cfg.CES = map[string]config.CESConfig{
+		"default":   {SessionPrefix: "default-prefix"},
+		"secondary": {SessionPrefix: "secondary-prefix"},
+	}
+
+	cesBackend, prefix, err := backendForRoute(cfg, config.ExtensionConfig{Backend: config.BackendCES, Profile: "secondary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cesBackend.Name() != config.BackendCES || prefix != "secondary-prefix" {
+		t.Fatalf("CES backend = %q, prefix = %q", cesBackend.Name(), prefix)
+	}
+}
+
+func TestBackendForRouteRejectsMissingProfile(t *testing.T) {
+	cfg := config.Default()
+	cfg.WebSocket = map[string]config.WebSocketConfig{"default": {}}
+
+	_, _, err := backendForRoute(cfg, config.ExtensionConfig{Backend: config.BackendWebSocket, Profile: "missing"})
+	if err == nil || !strings.Contains(err.Error(), `websocket profile "missing" not configured`) {
+		t.Fatalf("backendForRoute() error = %v", err)
 	}
 }
 
