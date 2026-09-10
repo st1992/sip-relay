@@ -28,13 +28,39 @@ type Resampler struct {
 	ratio   float64 // input samples consumed per output sample (fromHz/toHz)
 	history []int16 // trailing samples retained from the previous Process call
 	frac    float64 // fractional position, within (history ++ next input), of the next output sample
+	// lp removes everything above the output's Nyquist frequency before the
+	// rate changes. Nil unless this is a downsample, since only downsampling
+	// can alias. See lowpass.go.
+	lp *lowpass
+}
+
+// ResamplerOption adjusts how a Resampler is constructed.
+type ResamplerOption func(*Resampler)
+
+// WithoutAntiAlias disables the decimation low-pass, leaving interpolation to
+// resample on its own. Only for input already known to be band-limited below
+// the output's Nyquist frequency, and for before/after comparison -- on
+// ordinary wideband audio it lets out-of-band energy fold into the output.
+func WithoutAntiAlias() ResamplerOption {
+	return func(r *Resampler) { r.lp = nil }
 }
 
 // NewResampler constructs a Resampler converting mono PCM16 from fromHz to
 // toHz. Both must be positive. fromHz == toHz is legal and reproduces the
 // input exactly (subject to the trailing-context latency described above).
-func NewResampler(fromHz, toHz int) *Resampler {
-	return &Resampler{ratio: float64(fromHz) / float64(toHz)}
+//
+// When toHz is lower than fromHz the conversion is anti-aliased by default:
+// interpolation alone would fold everything above the output's Nyquist
+// frequency back into the audible band.
+func NewResampler(fromHz, toHz int, opts ...ResamplerOption) *Resampler {
+	r := &Resampler{
+		ratio: float64(fromHz) / float64(toHz),
+		lp:    newLowpass(fromHz, toHz),
+	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Reset clears history and phase state as if newly constructed. For
@@ -42,6 +68,7 @@ func NewResampler(fromHz, toHz int) *Resampler {
 func (r *Resampler) Reset() {
 	r.history = nil
 	r.frac = 0
+	r.lp.reset()
 }
 
 // Process appends the resampled output for in to dst and returns the
@@ -53,6 +80,9 @@ func (r *Resampler) Process(dst []int16, in []int16) []int16 {
 	if len(in) == 0 {
 		return dst
 	}
+	// Band-limit before the rate changes. This replaces the samples but not
+	// their count, so everything below is unaffected.
+	in = r.lp.process(in)
 
 	const n = InterpolationOrder
 	histLen := len(r.history)
