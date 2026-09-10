@@ -84,6 +84,8 @@ type callResult struct {
 	silenceFrames  int
 	realFrames     int
 	realRunLengths []int
+	runtPackets    int
+	mediaRatio     float64
 	err            error
 }
 
@@ -133,7 +135,11 @@ func runSimulatedCall(idx int, duration time.Duration, jitter jitterProfile, rng
 	<-c.Done()
 	c.Close()
 
-	return callResult{idx: idx, gaps: col.gaps, silenceFrames: col.silence, realFrames: col.real, realRunLengths: col.realRunLengths}
+	return callResult{
+		idx: idx, gaps: col.gaps, silenceFrames: col.silence, realFrames: col.real,
+		realRunLengths: col.realRunLengths, runtPackets: col.runtPackets,
+		mediaRatio: col.mediaRatio(),
+	}
 }
 
 // feedInboundRTP simulates the caller sending steady PCMU audio so the
@@ -182,6 +188,29 @@ type collected struct {
 	// many short runs into fewer, longer ones for the same underlying
 	// jitter, even though total real/silence byte counts barely change.
 	realRunLengths []int
+
+	// firstTS/lastTS and firstAt/lastAt together give the media clock: the
+	// RTP timestamp span the relay emitted divided by the wall-clock time it
+	// took. The receiving endpoint plays out on the RTP timestamp clock, so
+	// anything below 1.0 means its jitter buffer is filled slower than it
+	// drains -- it underruns and conceals the shortfall by chopping words,
+	// no matter how even the inter-packet gaps look.
+	firstTS, lastTS uint32
+	firstAt, lastAt time.Time
+	// runtPackets counts outbound packets that were not exactly one frame.
+	// A short packet occupies a full frame interval while advancing the RTP
+	// clock by only part of one, so it starves the receiver the same way
+	// drift does.
+	runtPackets int
+}
+
+func (c collected) mediaRatio() float64 {
+	wall := c.lastAt.Sub(c.firstAt)
+	if wall <= 0 {
+		return 0
+	}
+	mediaMs := float64(c.lastTS-c.firstTS) / float64(relayrtp.SampleRate/1000)
+	return mediaMs / (float64(wall) / float64(time.Millisecond))
 }
 
 // collectOutbound reads every RTP packet the relay sends to the simulated
@@ -223,6 +252,15 @@ func collectOutbound(phone *net.UDPConn, duration time.Duration) collected {
 			res.gaps = append(res.gaps, now.Sub(last))
 		}
 		last = now
+		if res.firstAt.IsZero() {
+			res.firstAt = now
+			res.firstTS = pkt.Header.Timestamp
+		}
+		res.lastAt = now
+		res.lastTS = pkt.Header.Timestamp
+		if len(pkt.Payload) != relayrtp.SamplesPerFrame {
+			res.runtPackets++
+		}
 		if isSilence(pkt.Payload) {
 			res.silence++
 			flushRun()
@@ -362,10 +400,20 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// Bounds on the media clock (RTP timestamp span / wall clock). 1.000 is real
+// time; below that the receiving endpoint's jitter buffer starves and chops
+// words. Tight on purpose -- loose bounds would pass the regression this
+// exists to catch.
+const (
+	mediaClockMin = 0.99
+	mediaClockMax = 1.01
+)
+
 func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 	var allGaps []time.Duration
 	var allRunLengths []int
-	var totalSilence, totalReal, errs int
+	var totalSilence, totalReal, errs, totalRunts int
+	var worstRatio, bestRatio float64
 	for r := range results {
 		if r.err != nil {
 			errs++
@@ -376,6 +424,15 @@ func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 		totalSilence += r.silenceFrames
 		totalReal += r.realFrames
 		allRunLengths = append(allRunLengths, r.realRunLengths...)
+		totalRunts += r.runtPackets
+		if r.mediaRatio > 0 {
+			if worstRatio == 0 || r.mediaRatio < worstRatio {
+				worstRatio = r.mediaRatio
+			}
+			if r.mediaRatio > bestRatio {
+				bestRatio = r.mediaRatio
+			}
+		}
 	}
 	sort.Slice(allGaps, func(i, j int) bool { return allGaps[i] < allGaps[j] })
 	sort.Ints(allRunLengths)
@@ -421,9 +478,29 @@ func report(elapsed time.Duration, numCalls int, results <-chan callResult) {
 	fmt.Printf("gaps over %s (missed a 20ms outbound slot): %d / %d (%.3f%%)\n",
 		threshold, over, len(allGaps), 100*float64(over)/float64(len(allGaps)))
 
-	if over == 0 {
-		fmt.Println("=> outbound RTP stream stayed continuous through every injected backend stall")
+	fmt.Printf("media clock ratio: worst=%.4f best=%.4f (1.0000 == real time)\n", worstRatio, bestRatio)
+	fmt.Printf("runt packets (not exactly %d bytes): %d\n", relayrtp.SamplesPerFrame, totalRunts)
+
+	failed := false
+	if worstRatio < mediaClockMin || bestRatio > mediaClockMax {
+		fmt.Fprintf(os.Stderr,
+			"FAIL: media clock ratio outside [%.2f, %.2f] -- the endpoint's jitter buffer will starve and chop words\n",
+			mediaClockMin, mediaClockMax)
+		failed = true
 	}
+	if totalRunts > 0 {
+		fmt.Fprintf(os.Stderr,
+			"FAIL: %d runt packets -- backend chunk boundaries are reaching the wire\n", totalRunts)
+		failed = true
+	}
+	if over > 0 {
+		fmt.Fprintf(os.Stderr, "FAIL: %d inter-packet gaps exceeded %s\n", over, threshold)
+		failed = true
+	}
+	if failed {
+		os.Exit(1)
+	}
+	fmt.Println("=> outbound RTP stream held real time and stayed continuous through every injected backend stall")
 }
 
 func pct(sorted []time.Duration, p float64) time.Duration {

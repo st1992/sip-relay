@@ -311,67 +311,132 @@ func TestOutboundRTPWriterRebuffersAfterUnderrun(t *testing.T) {
 	}
 }
 
-func TestHandleCommandGatesOnMinBufferBeforeDraining(t *testing.T) {
-	w := &outboundRTPWriter{log: slog.Default(), port: &relayrtp.Port{}, buffering: true}
+// newTestWriter builds an outboundRTPWriter with no goroutine running, for
+// driving handleCommand/emitFrame directly. A zero-value Port is safe here:
+// WriteFrame returns early when no remote has been set.
+func newTestWriter(stats *mediaStats) *outboundRTPWriter {
+	return &outboundRTPWriter{
+		log:       slog.Default(),
+		stats:     stats,
+		port:      &relayrtp.Port{},
+		ring:      newByteRing(maxQueuedOutboundBytes),
+		frameBuf:  make([]byte, relayrtp.SamplesPerFrame),
+		buffering: true,
+	}
+}
 
-	var queue [][]byte
-	queue = w.handleCommand(queue, outboundRTPCommand{audio: make([]byte, minOutboundBufferBytes-1)})
+func TestEmitFrameGatesOnMinBufferBeforeDraining(t *testing.T) {
+	w := newTestWriter(&mediaStats{})
+
+	w.handleCommand(outboundRTPCommand{audio: make([]byte, minOutboundBufferBytes-1)})
+	w.emitFrame()
 	if !w.buffering {
-		t.Fatal("buffering should remain true below the minimum buffer threshold")
+		t.Fatal("buffering should remain armed below the minimum buffer threshold")
+	}
+	if w.ring.Len() != minOutboundBufferBytes-1 {
+		t.Fatalf("ring drained while still buffering: len = %d", w.ring.Len())
 	}
 
-	queue = w.handleCommand(queue, outboundRTPCommand{audio: []byte{0}})
+	w.handleCommand(outboundRTPCommand{audio: []byte{0}})
+	w.emitFrame()
 	if w.buffering {
 		t.Fatal("buffering should clear once the minimum buffer threshold is reached")
 	}
-	if len(queue) != 2 {
-		t.Fatalf("queue len = %d, want 2", len(queue))
+	if want := minOutboundBufferBytes - relayrtp.SamplesPerFrame; w.ring.Len() != want {
+		t.Fatalf("ring len after one frame = %d, want %d", w.ring.Len(), want)
+	}
+}
+
+// A partial frame must still play, padded -- only a completely empty buffer
+// re-arms the cushion. Stalling on a partial frame is what fragmented
+// continuous speech into short bursts separated by comfort noise.
+func TestEmitFramePadsPartialFrameInsteadOfStalling(t *testing.T) {
+	w := newTestWriter(&mediaStats{})
+
+	// Cross the threshold with a deliberately frame-unaligned amount.
+	const residue = 40
+	audio := bytes.Repeat([]byte{7}, minOutboundBufferBytes+residue)
+	w.handleCommand(outboundRTPCommand{audio: audio})
+
+	frames := (minOutboundBufferBytes + residue) / relayrtp.SamplesPerFrame
+	for i := 0; i < frames; i++ {
+		w.emitFrame()
+	}
+	if w.ring.Len() != residue {
+		t.Fatalf("ring len = %d, want the %d-byte residue", w.ring.Len(), residue)
+	}
+	if w.buffering {
+		t.Fatal("buffering re-armed while audio was still buffered")
+	}
+
+	w.emitFrame()
+	if w.ring.Len() != 0 {
+		t.Fatalf("partial frame was withheld instead of played: ring len = %d", w.ring.Len())
+	}
+	if w.buffering {
+		t.Fatal("a partial read must not re-arm buffering; only an empty buffer does")
+	}
+	for i := 0; i < residue; i++ {
+		if w.frameBuf[i] != 7 {
+			t.Fatalf("frame[%d] = %#x, want the real audio byte", i, w.frameBuf[i])
+		}
+	}
+	for i := residue; i < len(w.frameBuf); i++ {
+		if w.frameBuf[i] != relayrtp.SilenceByte {
+			t.Fatalf("frame[%d] = %#x, want silence padding", i, w.frameBuf[i])
+		}
+	}
+
+	// Now it is genuinely dry.
+	w.emitFrame()
+	if !w.buffering {
+		t.Fatal("an empty buffer should re-arm buffering")
 	}
 }
 
 func TestHandleCommandInterruptRearmsBuffering(t *testing.T) {
-	w := &outboundRTPWriter{log: slog.Default(), port: &relayrtp.Port{}, buffering: false, queuedBytes: 10}
-	queue := [][]byte{make([]byte, 10)}
+	w := newTestWriter(&mediaStats{})
+	w.buffering = false
+	w.handleCommand(outboundRTPCommand{audio: make([]byte, 10)})
 
-	queue = w.handleCommand(queue, outboundRTPCommand{interrupt: true})
+	w.handleCommand(outboundRTPCommand{interrupt: true})
 	if !w.buffering {
 		t.Fatal("interrupt should re-arm buffering so playback resumes with a fresh cushion")
 	}
-	if len(queue) != 0 || w.queuedBytes != 0 {
-		t.Fatalf("interrupt should reset queue and queuedBytes, got len=%d queuedBytes=%d", len(queue), w.queuedBytes)
+	if w.ring.Len() != 0 {
+		t.Fatalf("interrupt should discard buffered audio, got len = %d", w.ring.Len())
 	}
 }
 
 func TestOutboundRTPWriterDropsAudioBeyondQueueCap(t *testing.T) {
 	stats := &mediaStats{}
-	w := &outboundRTPWriter{log: slog.Default(), stats: stats, port: &relayrtp.Port{}}
+	w := newTestWriter(stats)
 
 	chunk := make([]byte, maxQueuedOutboundBytes/2)
-	var queue [][]byte
-	queue = w.handleCommand(queue, outboundRTPCommand{audio: chunk})
-	queue = w.handleCommand(queue, outboundRTPCommand{audio: chunk})
-	if len(queue) != 2 || w.queuedBytes != 2*len(chunk) {
-		t.Fatalf("expected both chunks accepted within cap: queue len = %d, queuedBytes = %d", len(queue), w.queuedBytes)
+	w.handleCommand(outboundRTPCommand{audio: chunk})
+	w.handleCommand(outboundRTPCommand{audio: chunk})
+	if w.ring.Len() != 2*len(chunk) {
+		t.Fatalf("expected both chunks accepted within cap: ring len = %d", w.ring.Len())
 	}
 
 	// A backend that keeps producing audio faster than real-time must have
 	// the overflow dropped, not buffered without bound.
-	queue = w.handleCommand(queue, outboundRTPCommand{audio: chunk})
-	if len(queue) != 2 {
-		t.Fatalf("expected chunk beyond cap to be dropped, queue len = %d", len(queue))
+	w.handleCommand(outboundRTPCommand{audio: chunk})
+	if w.ring.Len() != 2*len(chunk) {
+		t.Fatalf("expected chunk beyond cap to be dropped, ring len = %d", w.ring.Len())
 	}
 	if got := stats.outboundAudioBytesDropped.Load(); got != uint64(len(chunk)) {
 		t.Fatalf("outboundAudioBytesDropped = %d, want %d", got, len(chunk))
 	}
 
-	// Barge-in must still clear the queue and let audio flow again afterward.
-	queue = w.handleCommand(queue, outboundRTPCommand{interrupt: true})
-	if len(queue) != 0 || w.queuedBytes != 0 {
-		t.Fatalf("interrupt should reset queue and queuedBytes, got len=%d queuedBytes=%d", len(queue), w.queuedBytes)
+	// Barge-in must still clear the buffer and let audio flow again afterward.
+	w.handleCommand(outboundRTPCommand{interrupt: true})
+	if w.ring.Len() != 0 {
+		t.Fatalf("interrupt should reset the ring, got len = %d", w.ring.Len())
 	}
-	queue = w.handleCommand(queue, outboundRTPCommand{audio: chunk})
-	if len(queue) != 1 {
-		t.Fatalf("expected audio to be accepted again after interrupt reset, queue len = %d", len(queue))
+	w.handleCommand(outboundRTPCommand{audio: chunk})
+	if w.ring.Len() != len(chunk) {
+		t.Fatalf("expected audio to be accepted again after interrupt reset, ring len = %d", w.ring.Len())
 	}
 }
 

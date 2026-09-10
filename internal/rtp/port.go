@@ -29,9 +29,9 @@ const (
 	SilenceByte = 0xff
 )
 
-var silenceFrame = newSilenceFrame()
-
-func newSilenceFrame() []byte {
+// NewSilenceFrame returns one fresh frame of PCMU silence, for callers that
+// need to emit comfort noise or pad a partially filled frame.
+func NewSilenceFrame() []byte {
 	b := make([]byte, SamplesPerFrame)
 	for i := range b {
 		b[i] = SilenceByte
@@ -40,13 +40,15 @@ func newSilenceFrame() []byte {
 }
 
 type Config struct {
-	ListenIP            string
-	PortMin             int
-	PortMax             int
-	SymmetricRTP        bool
-	PayloadType         uint8
-	OutboundPacketBytes int
-	OutboundPacketEvery time.Duration
+	ListenIP     string
+	PortMin      int
+	PortMax      int
+	SymmetricRTP bool
+	PayloadType  uint8
+	// OutboundFrameBytes is the fixed payload size of every outbound RTP
+	// packet, and equally the amount the RTP timestamp advances per packet.
+	// Defaults to SamplesPerFrame (one 20ms PCMU frame).
+	OutboundFrameBytes  int
 	MediaTimeoutInitial time.Duration
 	MediaTimeout        time.Duration
 	Log                 *slog.Logger
@@ -57,24 +59,16 @@ type Port struct {
 	log          *slog.Logger
 	payloadType  uint8
 	symmetricRTP bool
-	packetBytes  int
-	packetEvery  time.Duration
+	frameBytes   int
 	initialTO    time.Duration
 	mediaTO      time.Duration
 	remote       atomic.Pointer[net.UDPAddr]
 	closed       atomic.Bool
 
-	writeMu   sync.Mutex
-	seq       uint16
-	ts        uint32
-	ssrc      uint32
-	nextAt    time.Time
-	paceSeq   uint64
-	talkspurt bool
-
-	interruptMu  sync.Mutex
-	interruptCh  chan struct{}
-	interruptSeq atomic.Uint64
+	writeMu sync.Mutex
+	seq     uint16
+	ts      uint32
+	ssrc    uint32
 
 	received       chan []byte
 	firstPacket    chan struct{}
@@ -95,11 +89,8 @@ func Listen(conf Config) (*Port, error) {
 	if conf.MediaTimeout <= 0 {
 		conf.MediaTimeout = 15 * time.Second
 	}
-	if conf.OutboundPacketBytes <= 0 {
-		conf.OutboundPacketBytes = SamplesPerFrame
-	}
-	if conf.OutboundPacketEvery <= 0 {
-		conf.OutboundPacketEvery = FrameDuration
+	if conf.OutboundFrameBytes <= 0 {
+		conf.OutboundFrameBytes = SamplesPerFrame
 	}
 
 	conn, err := listenUDPRange(conf.ListenIP, conf.PortMin, conf.PortMax)
@@ -113,8 +104,7 @@ func Listen(conf Config) (*Port, error) {
 		log:          conf.Log,
 		payloadType:  conf.PayloadType,
 		symmetricRTP: conf.SymmetricRTP,
-		packetBytes:  conf.OutboundPacketBytes,
-		packetEvery:  conf.OutboundPacketEvery,
+		frameBytes:   conf.OutboundFrameBytes,
 		initialTO:    conf.MediaTimeoutInitial,
 		mediaTO:      conf.MediaTimeout,
 		seq:          seq,
@@ -122,7 +112,6 @@ func Listen(conf Config) (*Port, error) {
 		ssrc:         randomUint32(),
 		received:     make(chan []byte, 128),
 		firstPacket:  make(chan struct{}),
-		interruptCh:  make(chan struct{}),
 	}
 	return port, nil
 }
@@ -186,73 +175,63 @@ func (p *Port) Run(ctx context.Context) error {
 	}
 }
 
-func (p *Port) WritePayload(payload []byte) error {
+// FrameBytes reports the fixed outbound payload size this Port emits.
+func (p *Port) FrameBytes() int {
+	if p == nil || p.frameBytes <= 0 {
+		return SamplesPerFrame
+	}
+	return p.frameBytes
+}
+
+// WriteFrame sends exactly one RTP packet, immediately. It never blocks and
+// never paces: the caller owns the media clock, so that pacing lives in one
+// place instead of being split across two clocks that drift against each
+// other.
+//
+// Two invariants make the outbound stream a clean, continuous media stream:
+//
+//   - The timestamp advances by a fixed frame every packet, never by
+//     len(payload). Deriving it from the payload length lets a short frame
+//     advance the media clock by less than the wall-clock time it occupied,
+//     which starves the receiver's jitter buffer. Callers must therefore hand
+//     WriteFrame exactly FrameBytes() bytes, padding with SilenceByte when
+//     they have less real audio than that.
+//
+//   - The marker bit is never set. It means "start of a new talkspurt", and
+//     receivers commonly react by resetting their jitter buffer and dropping
+//     what it holds. Since this Port emits an unbroken stream (comfort noise
+//     included) with contiguous timestamps, there is no talkspurt boundary to
+//     signal, and setting it mid-call would cut off audio already in flight.
+func (p *Port) WriteFrame(payload []byte) error {
 	if p == nil || len(payload) == 0 {
 		return nil
 	}
-	interruptSeq := p.interruptSeq.Load()
 
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 
-	for len(payload) > 0 {
-		if p.outboundInterrupted(interruptSeq) {
-			return nil
-		}
-		n := len(payload)
-		if n > p.packetBytes {
-			n = p.packetBytes
-		}
-		marker := !p.talkspurt
-		if err := p.writePacketLocked(payload[:n], interruptSeq, marker); err != nil {
-			if errors.Is(err, errOutboundInterrupted) {
-				return nil
-			}
-			return err
-		}
-		p.talkspurt = true
-		payload = payload[n:]
-	}
-	return nil
-}
-
-// WriteSilenceFrame sends one paced frame of PCMU silence. The outbound RTP
-// writer calls this whenever no real backend audio is available so the RTP
-// stream to the caller never goes quiet for a whole packet interval: gaps in
-// backend delivery (network jitter, TTS generation pauses) would otherwise
-// starve the pacer in WritePayload and produce audible dead air instead of a
-// continuous, smooth stream.
-func (p *Port) WriteSilenceFrame() error {
-	if p == nil {
+	remote := p.remote.Load()
+	if remote == nil {
 		return nil
 	}
-	interruptSeq := p.interruptSeq.Load()
 
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
+	header := pionrtp.Header{
+		Version:        2,
+		PayloadType:    p.payloadType,
+		SequenceNumber: p.seq,
+		Timestamp:      p.ts,
+		SSRC:           p.ssrc,
+		Marker:         false,
+	}
+	p.seq++
+	p.ts += uint32(p.FrameBytes())
 
-	if err := p.writePacketLocked(silenceFrame, interruptSeq, false); err != nil {
-		if errors.Is(err, errOutboundInterrupted) {
-			return nil
-		}
+	raw, err := (&pionrtp.Packet{Header: header, Payload: payload}).Marshal()
+	if err != nil {
 		return err
 	}
-	p.talkspurt = false
-	return nil
-}
-
-func (p *Port) InterruptOutbound() {
-	if p == nil {
-		return
-	}
-	p.interruptSeq.Add(1)
-
-	p.interruptMu.Lock()
-	if p.interruptCh != nil {
-		close(p.interruptCh)
-	}
-	p.interruptCh = make(chan struct{})
-	p.interruptMu.Unlock()
+	_, err = p.conn.WriteToUDP(raw, remote)
+	return err
 }
 
 func (p *Port) Close() error {
@@ -295,83 +274,6 @@ func (p *Port) readLoop() error {
 			p.log.Warn("dropping RTP payload because relay input queue is full")
 		}
 	}
-}
-
-var errOutboundInterrupted = errors.New("outbound RTP interrupted")
-
-func (p *Port) writePacketLocked(payload []byte, interruptSeq uint64, marker bool) error {
-	remote := p.remote.Load()
-	if remote == nil {
-		return nil
-	}
-
-	if p.paceSeq != interruptSeq {
-		p.nextAt = time.Time{}
-		p.paceSeq = interruptSeq
-	}
-
-	if p.packetEvery > 0 {
-		now := time.Now()
-		if !p.nextAt.IsZero() && now.Before(p.nextAt) {
-			if p.waitForOutboundTurn(time.Until(p.nextAt), interruptSeq) {
-				return errOutboundInterrupted
-			}
-		}
-	}
-	if p.outboundInterrupted(interruptSeq) {
-		return errOutboundInterrupted
-	}
-
-	header := pionrtp.Header{
-		Version:        2,
-		PayloadType:    p.payloadType,
-		SequenceNumber: p.seq,
-		Timestamp:      p.ts,
-		SSRC:           p.ssrc,
-		Marker:         marker,
-	}
-	p.seq++
-	p.ts += uint32(len(payload))
-
-	raw, err := (&pionrtp.Packet{Header: header, Payload: payload}).Marshal()
-	if err != nil {
-		return err
-	}
-	_, err = p.conn.WriteToUDP(raw, remote)
-	if err == nil && p.packetEvery > 0 {
-		p.nextAt = time.Now().Add(p.packetEvery)
-	}
-	return err
-}
-
-func (p *Port) waitForOutboundTurn(d time.Duration, interruptSeq uint64) bool {
-	if d <= 0 {
-		return p.outboundInterrupted(interruptSeq)
-	}
-	if p.outboundInterrupted(interruptSeq) {
-		return true
-	}
-
-	p.interruptMu.Lock()
-	interruptCh := p.interruptCh
-	p.interruptMu.Unlock()
-	if p.outboundInterrupted(interruptSeq) {
-		return true
-	}
-
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-
-	select {
-	case <-timer.C:
-		return p.outboundInterrupted(interruptSeq)
-	case <-interruptCh:
-		return true
-	}
-}
-
-func (p *Port) outboundInterrupted(interruptSeq uint64) bool {
-	return p.interruptSeq.Load() != interruptSeq
 }
 
 func listenUDPRange(listenIP string, minPort, maxPort int) (*net.UDPConn, error) {

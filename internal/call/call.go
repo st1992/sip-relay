@@ -240,10 +240,7 @@ func (c *Call) run(ctx context.Context) {
 }
 
 func (c *Call) sendRTPToBackend(ctx context.Context, stream backend.Stream, recorder *calllog.Recorder, stats *mediaStats) error {
-	silence := make([]byte, relayrtp.SamplesPerFrame)
-	for i := range silence {
-		silence[i] = relayrtp.SilenceByte
-	}
+	silence := relayrtp.NewSilenceFrame()
 
 	ticker := time.NewTicker(relayrtp.FrameDuration)
 	defer ticker.Stop()
@@ -475,16 +472,26 @@ const maxQueuedOutboundBytes = 30 * relayrtp.SampleRate
 
 // minOutboundBufferBytes is the minimum amount of backend audio held in
 // reserve before the pacer starts draining it to the caller -- and again
-// after any underrun, before resuming. Without this, real audio gets played
+// after the buffer runs completely dry. Without this, real audio gets played
 // the instant it arrives with nothing in reserve, so any further delivery
 // jitter immediately causes another audible dropout: a repeating
 // burst/silence stutter under chronically uneven backend delivery, not just
 // an occasional glitch. This mirrors LiveKit SIP's own outbound jitter
-// buffer (media-sdk's mixer.Input: a ~100ms ring buffer gated on a 60ms
-// minimum fill, re-armed after every starve). 60ms (3 frames) absorbs
-// typical delivery jitter at the cost of a small, fixed, and imperceptible
-// amount of onset latency per utterance.
+// buffer (media-sdk's mixer.Input, gated on inputBufferMin and re-armed
+// whenever a read comes back empty). 60ms (3 frames) absorbs typical
+// delivery jitter at the cost of a small, fixed, and imperceptible amount of
+// onset latency per utterance.
 const minOutboundBufferBytes = 3 * relayrtp.SamplesPerFrame
+
+// maxCatchUpFrames bounds how many frames a single tick may emit while
+// repaying a scheduling deficit. Catch-up is what keeps the media clock on
+// real time (see emitDue), but after a pathological stall -- a long GC pause,
+// a descheduled container -- repaying the whole debt at once would burst
+// hundreds of packets at the caller. Past this point the audio is too stale
+// to be worth delivering, so the clock is re-anchored to now and the
+// remaining debt written off. 5 frames (100ms) matches LiveKit's
+// mixer.inputBufferFrames clamp.
+const maxCatchUpFrames = 5
 
 type outboundRTPCommand struct {
 	audio     []byte
@@ -497,27 +504,35 @@ type outboundRTPWriter struct {
 	log      *slog.Logger
 	stats    *mediaStats
 	commands chan outboundRTPCommand
-	write    chan []byte
 
-	// queuedBytes, overCap, and buffering are only ever touched from the
-	// manage() goroutine, so they need no synchronization of their own.
-	queuedBytes int
-	overCap     bool
-	buffering   bool
+	// Everything below is owned exclusively by the run() goroutine and so
+	// needs no synchronization of its own.
+	ring      *byteRing
+	frameBuf  []byte
+	overCap   bool
+	buffering bool
+	// lastFrameEnd is the absolute deadline the media clock is anchored to:
+	// the wall-clock instant the most recently emitted frame was due to end.
+	// It advances by exact multiples of the frame duration, never by "now",
+	// which is what stops timer overshoot from accumulating into drift.
+	lastFrameEnd time.Time
 }
 
 func newOutboundRTPWriter(ctx context.Context, port *relayrtp.Port, log *slog.Logger, stats *mediaStats) *outboundRTPWriter {
 	writer := &outboundRTPWriter{
-		ctx:       ctx,
-		port:      port,
-		log:       log,
-		stats:     stats,
-		commands:  make(chan outboundRTPCommand),
-		write:     make(chan []byte),
+		ctx:   ctx,
+		port:  port,
+		log:   log,
+		stats: stats,
+		// Buffered so a bursty backend can hand off several chunks without
+		// blocking on the tick loop. Ordering is still exact: every command
+		// is applied by run(), in the order it was sent.
+		commands:  make(chan outboundRTPCommand, 64),
+		ring:      newByteRing(maxQueuedOutboundBytes),
+		frameBuf:  make([]byte, relayrtp.SamplesPerFrame),
 		buffering: true,
 	}
-	go writer.manage()
-	go writer.writeLoop()
+	go writer.run()
 	return writer
 }
 
@@ -539,120 +554,125 @@ func (w *outboundRTPWriter) Interrupt() bool {
 	}
 }
 
-func (w *outboundRTPWriter) manage() {
-	defer close(w.write)
-
-	var queue [][]byte
-	for {
-		if w.buffering || len(queue) == 0 {
-			select {
-			case <-w.ctx.Done():
-				return
-			case cmd := <-w.commands:
-				queue = w.handleCommand(queue, cmd)
-			}
-			continue
-		}
-
-		select {
-		case cmd := <-w.commands:
-			queue = w.handleCommand(queue, cmd)
-			continue
-		default:
-		}
-
-		select {
-		case <-w.ctx.Done():
-			return
-		case cmd := <-w.commands:
-			queue = w.handleCommand(queue, cmd)
-		case w.write <- queue[0]:
-			w.queuedBytes -= len(queue[0])
-			queue[0] = nil
-			queue = queue[1:]
-			if len(queue) == 0 {
-				// Underrun: demand a fresh cushion before resuming, rather
-				// than immediately playing whatever lands next.
-				w.buffering = true
-			}
-		}
-	}
-}
-
-func (w *outboundRTPWriter) handleCommand(queue [][]byte, cmd outboundRTPCommand) [][]byte {
-	if cmd.interrupt {
-		w.port.InterruptOutbound()
-		for i := range queue {
-			queue[i] = nil
-		}
-		w.queuedBytes = 0
-		w.overCap = false
-		w.buffering = true
-		return queue[:0]
-	}
-	if len(cmd.audio) == 0 {
-		return queue
-	}
-	if w.queuedBytes+len(cmd.audio) > maxQueuedOutboundBytes {
-		if !w.overCap {
-			w.overCap = true
-			w.log.Warn("dropping backend audio: outbound RTP queue exceeded its cap",
-				"queued_bytes", w.queuedBytes, "cap_bytes", maxQueuedOutboundBytes)
-		}
-		if w.stats != nil {
-			w.stats.outboundAudioBytesDropped.Add(uint64(len(cmd.audio)))
-		}
-		return queue
-	}
-	w.overCap = false
-	w.queuedBytes += len(cmd.audio)
-	queue = append(queue, cmd.audio)
-	if w.buffering && w.queuedBytes >= minOutboundBufferBytes {
-		w.buffering = false
-	}
-	return queue
-}
-
-// writeLoop drains queued backend audio onto the RTP port. Real audio always
-// takes priority; when none is queued, it pads the outbound stream with
-// silence at the same 20ms cadence so the RTP stream to the caller stays
-// continuous instead of going quiet whenever the backend falls behind
-// real-time (network jitter, TTS generation pauses). Port.WritePayload and
-// Port.WriteSilenceFrame share the same internal pacer, so cadence stays
-// correct regardless of which one is called.
-func (w *outboundRTPWriter) writeLoop() {
+// run is the single owner of the outbound media clock. Buffering backend
+// audio and emitting RTP both happen here, on one goroutine driven by one
+// ticker, so there is exactly one clock deciding when a frame goes out.
+//
+// The previous design split this across two goroutines with two independent
+// 20ms clocks -- a ticker here and a pacer inside rtp.Port -- which beat
+// against each other: a pending tick could win the race against real audio
+// that was already available and emit comfort noise in the middle of a word.
+func (w *outboundRTPWriter) run() {
 	ticker := time.NewTicker(relayrtp.FrameDuration)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case audio, ok := <-w.write:
-			if !ok {
-				return
-			}
-			if err := w.port.WritePayload(audio); err != nil {
-				w.log.Warn("failed to write RTP audio", "error", err)
-			}
-			continue
-		default:
-		}
-
-		select {
 		case <-w.ctx.Done():
 			return
-		case audio, ok := <-w.write:
-			if !ok {
-				return
-			}
-			if err := w.port.WritePayload(audio); err != nil {
-				w.log.Warn("failed to write RTP audio", "error", err)
-			}
+		case cmd := <-w.commands:
+			w.handleCommand(cmd)
 		case <-ticker.C:
-			if err := w.port.WriteSilenceFrame(); err != nil {
-				w.log.Warn("failed to write RTP silence", "error", err)
-			}
+			w.emitDue()
 		}
 	}
+}
+
+// emitDue emits however many frames the media clock currently owes.
+//
+// Timers only ever fire late, so scheduling each frame relative to when the
+// previous one actually went out silently bakes every wake-up overshoot into
+// the cadence: at a measured ~1.25ms of overshoot per 20ms frame the stream
+// runs ~6% slow, the receiver's jitter buffer drains faster than it fills,
+// and it conceals the shortfall by chopping words. Anchoring to an absolute
+// deadline and emitting the backlog instead keeps the media clock locked to
+// real time no matter how imprecise the timer is. This mirrors LiveKit's
+// mixer.mixUpdate.
+func (w *outboundRTPWriter) emitDue() {
+	now := time.Now()
+	if w.lastFrameEnd.IsZero() {
+		w.lastFrameEnd = now
+		w.emitFrame()
+		return
+	}
+
+	dt := now.Sub(w.lastFrameEnd)
+	if dt < 0 {
+		// Woke a shade early; the frame isn't due yet.
+		return
+	}
+	// Fuzz, so a tick arriving a hair under the deadline still counts as the
+	// frame it was meant to be rather than deferring to the next tick.
+	dt += relayrtp.FrameDuration / 4
+
+	n := int(dt / relayrtp.FrameDuration)
+	w.lastFrameEnd = w.lastFrameEnd.Add(time.Duration(n) * relayrtp.FrameDuration)
+	if n > maxCatchUpFrames {
+		n = maxCatchUpFrames
+		w.lastFrameEnd = now
+	}
+	for i := 0; i < n; i++ {
+		w.emitFrame()
+	}
+}
+
+// emitFrame sends exactly one full frame, always. Whatever real audio is
+// available fills the front of it and PCMU silence pads the rest, so backend
+// chunk boundaries never reach the wire as short RTP packets: a short packet
+// advances the RTP timestamp by less than the wall-clock time it occupies,
+// which is the same starvation as drift by another route.
+func (w *outboundRTPWriter) emitFrame() {
+	frame := w.frameBuf
+	n := 0
+	if w.buffering {
+		// Hold playout until the cushion is restocked.
+		if w.ring.Len() >= minOutboundBufferBytes {
+			w.buffering = false
+			n = w.ring.Read(frame)
+		}
+	} else {
+		n = w.ring.Read(frame)
+		if n == 0 {
+			// Genuinely dry -- not merely short. A partial read still plays
+			// (padded); only a completely empty buffer re-arms the cushion.
+			w.buffering = true
+		}
+	}
+	for i := n; i < len(frame); i++ {
+		frame[i] = relayrtp.SilenceByte
+	}
+	if err := w.port.WriteFrame(frame); err != nil {
+		w.log.Warn("failed to write RTP frame", "error", err)
+	}
+}
+
+func (w *outboundRTPWriter) handleCommand(cmd outboundRTPCommand) {
+	if cmd.interrupt {
+		// Barge-in: the bot is no longer saying this, so drop it rather than
+		// playing it over the caller. Nothing is in flight inside the port --
+		// WriteFrame never blocks -- so clearing the buffer is the whole job.
+		w.ring.Reset()
+		w.overCap = false
+		w.buffering = true
+		return
+	}
+	if len(cmd.audio) == 0 {
+		return
+	}
+
+	accepted := w.ring.Write(cmd.audio)
+	if dropped := len(cmd.audio) - accepted; dropped > 0 {
+		if !w.overCap {
+			w.overCap = true
+			w.log.Warn("dropping backend audio: outbound RTP buffer exceeded its cap",
+				"buffered_bytes", w.ring.Len(), "cap_bytes", w.ring.Cap())
+		}
+		if w.stats != nil {
+			w.stats.outboundAudioBytesDropped.Add(uint64(dropped))
+		}
+		return
+	}
+	w.overCap = false
 }
 
 func (c *Call) setEndReason(reason EndReason) {

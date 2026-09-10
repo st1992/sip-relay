@@ -14,7 +14,7 @@ func TestPortForwardsPayloadBytesOnly(t *testing.T) {
 		ListenIP:            "127.0.0.1",
 		PayloadType:         0,
 		SymmetricRTP:        true,
-		OutboundPacketBytes: 160,
+		OutboundFrameBytes:  160,
 		MediaTimeoutInitial: time.Second,
 		MediaTimeout:        time.Second,
 	})
@@ -59,279 +59,142 @@ func TestPortForwardsPayloadBytesOnly(t *testing.T) {
 	}
 }
 
-func TestPortWritesRTPWithPayloadLengthTimestamps(t *testing.T) {
-	port, err := Listen(Config{
-		ListenIP:            "127.0.0.1",
-		PayloadType:         0,
-		OutboundPacketBytes: 3,
-		MediaTimeoutInitial: time.Second,
-		MediaTimeout:        time.Second,
-	})
-	if err != nil {
+func TestPortWriteFrameUsesFixedTimestampIncrement(t *testing.T) {
+	port, peer := writeFramePortAndPeer(t, 3)
+
+	if err := port.WriteFrame([]byte{1, 2, 3}); err != nil {
 		t.Fatal(err)
 	}
-	defer port.Close()
-
-	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
+	// Deliberately short: the caller is expected to pad, but even if it does
+	// not, the timestamp must still advance by a whole frame. Deriving the
+	// increment from len(payload) is what let short frames advance the media
+	// clock by less than the wall-clock time they occupy.
+	if err := port.WriteFrame([]byte{4}); err != nil {
 		t.Fatal(err)
 	}
-	defer peer.Close()
-	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
-
-	if err := port.WritePayload([]byte{1, 2, 3, 4, 5}); err != nil {
+	if err := port.WriteFrame([]byte{5, 6, 7}); err != nil {
 		t.Fatal(err)
 	}
 
 	first := readPacket(t, peer)
 	second := readPacket(t, peer)
+	third := readPacket(t, peer)
+
 	if string(first.Payload) != string([]byte{1, 2, 3}) {
-		t.Fatalf("first payload = %v", first.Payload)
+		t.Fatalf("first payload = %v, want the frame handed in unsplit", first.Payload)
 	}
-	if string(second.Payload) != string([]byte{4, 5}) {
-		t.Fatalf("second payload = %v", second.Payload)
+	if second.SequenceNumber != first.SequenceNumber+1 || third.SequenceNumber != second.SequenceNumber+1 {
+		t.Fatalf("sequence did not increment by one per frame: %d, %d, %d",
+			first.SequenceNumber, second.SequenceNumber, third.SequenceNumber)
 	}
-	if second.SequenceNumber != first.SequenceNumber+1 {
-		t.Fatalf("sequence did not increment: %d then %d", first.SequenceNumber, second.SequenceNumber)
+	if got := second.Timestamp - first.Timestamp; got != 3 {
+		t.Fatalf("timestamp increment = %d, want the fixed frame size 3", got)
 	}
-	if second.Timestamp != first.Timestamp+uint32(len(first.Payload)) {
-		t.Fatalf("timestamp increment = %d, want %d", second.Timestamp-first.Timestamp, len(first.Payload))
-	}
-}
-
-func TestPortPacesOutboundRTPPackets(t *testing.T) {
-	port, err := Listen(Config{
-		ListenIP:            "127.0.0.1",
-		PayloadType:         0,
-		OutboundPacketBytes: 3,
-		OutboundPacketEvery: 25 * time.Millisecond,
-		MediaTimeoutInitial: time.Second,
-		MediaTimeout:        time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer port.Close()
-
-	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
-
-	done := make(chan error, 1)
-	go func() {
-		done <- port.WritePayload([]byte{1, 2, 3, 4, 5, 6})
-	}()
-
-	_ = readPacket(t, peer)
-	firstAt := time.Now()
-	_ = readPacket(t, peer)
-	secondAt := time.Now()
-
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := secondAt.Sub(firstAt); elapsed < 15*time.Millisecond {
-		t.Fatalf("packets were not paced: elapsed = %s", elapsed)
+	if got := third.Timestamp - second.Timestamp; got != 3 {
+		t.Fatalf("timestamp increment after a short frame = %d, want the fixed frame size 3", got)
 	}
 }
 
-func TestPortPacesAcrossWritePayloadCalls(t *testing.T) {
-	port, err := Listen(Config{
-		ListenIP:            "127.0.0.1",
-		PayloadType:         0,
-		OutboundPacketBytes: 3,
-		OutboundPacketEvery: 25 * time.Millisecond,
-		MediaTimeoutInitial: time.Second,
-		MediaTimeout:        time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestPortWriteFrameNeverSetsMarker(t *testing.T) {
+	port, peer := writeFramePortAndPeer(t, 3)
+
+	// The marker bit means "new talkspurt", and receivers commonly react by
+	// resetting their jitter buffer and dropping what it holds. This Port
+	// emits one unbroken stream with contiguous timestamps, so there is never
+	// a talkspurt boundary to signal -- not on the first frame, not after
+	// comfort noise.
+	frames := [][]byte{
+		{1, 2, 3},
+		{4, 5, 6},
+		{SilenceByte, SilenceByte, SilenceByte},
+		{7, 8, 9},
 	}
-	defer port.Close()
-
-	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
-
-	done := make(chan error, 1)
-	go func() {
-		if err := port.WritePayload([]byte{1, 2, 3}); err != nil {
-			done <- err
-			return
-		}
-		done <- port.WritePayload([]byte{4, 5, 6})
-	}()
-
-	_ = readPacket(t, peer)
-	firstAt := time.Now()
-	_ = readPacket(t, peer)
-	secondAt := time.Now()
-
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if elapsed := secondAt.Sub(firstAt); elapsed < 15*time.Millisecond {
-		t.Fatalf("packets across writes were not paced: elapsed = %s", elapsed)
-	}
-}
-
-func TestPortInterruptsOutboundWritePayload(t *testing.T) {
-	port, err := Listen(Config{
-		ListenIP:            "127.0.0.1",
-		PayloadType:         0,
-		OutboundPacketBytes: 3,
-		OutboundPacketEvery: 200 * time.Millisecond,
-		MediaTimeoutInitial: time.Second,
-		MediaTimeout:        time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer port.Close()
-
-	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
-
-	done := make(chan error, 1)
-	go func() {
-		done <- port.WritePayload([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9})
-	}()
-
-	first := readPacket(t, peer)
-	if string(first.Payload) != string([]byte{1, 2, 3}) {
-		t.Fatalf("first payload = %v", first.Payload)
-	}
-
-	port.InterruptOutbound()
-
-	select {
-	case err := <-done:
-		if err != nil {
+	for _, f := range frames {
+		if err := port.WriteFrame(f); err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("timed out waiting for interrupted payload write")
 	}
-
-	if err := peer.SetReadDeadline(time.Now().Add(75 * time.Millisecond)); err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, 1500)
-	if _, _, err := peer.ReadFromUDP(buf); err == nil {
-		t.Fatal("received packet after outbound write was interrupted")
-	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-		t.Fatalf("read after interrupt failed with unexpected error: %v", err)
-	}
-
-	if err := port.WritePayload([]byte{10, 11, 12}); err != nil {
-		t.Fatal(err)
-	}
-	next := readPacket(t, peer)
-	if string(next.Payload) != string([]byte{10, 11, 12}) {
-		t.Fatalf("next payload = %v", next.Payload)
-	}
-}
-
-func TestPortSetsMarkerOnTalkspurtStartOnly(t *testing.T) {
-	port, err := Listen(Config{
-		ListenIP:            "127.0.0.1",
-		PayloadType:         0,
-		OutboundPacketBytes: 3,
-		MediaTimeoutInitial: time.Second,
-		MediaTimeout:        time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer port.Close()
-
-	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
-
-	if err := port.WritePayload([]byte{1, 2, 3, 4, 5, 6}); err != nil {
-		t.Fatal(err)
-	}
-	first := readPacket(t, peer)
-	second := readPacket(t, peer)
-	if !first.Marker {
-		t.Fatal("first packet of a talkspurt should set the marker bit")
-	}
-	if second.Marker {
-		t.Fatal("second packet of the same talkspurt should not set the marker bit")
-	}
-
-	if err := port.WriteSilenceFrame(); err != nil {
-		t.Fatal(err)
-	}
-	silence := readPacket(t, peer)
-	if silence.Marker {
-		t.Fatal("injected silence frame should not set the marker bit")
-	}
-
-	if err := port.WritePayload([]byte{7, 8, 9}); err != nil {
-		t.Fatal(err)
-	}
-	resumed := readPacket(t, peer)
-	if !resumed.Marker {
-		t.Fatal("first real packet after silence should set the marker bit")
-	}
-}
-
-func TestPortWriteSilenceFrameSendsSilencePayload(t *testing.T) {
-	port, err := Listen(Config{
-		ListenIP:            "127.0.0.1",
-		PayloadType:         0,
-		MediaTimeoutInitial: time.Second,
-		MediaTimeout:        time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer port.Close()
-
-	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
-	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
-
-	if err := port.WriteSilenceFrame(); err != nil {
-		t.Fatal(err)
-	}
-	pkt := readPacket(t, peer)
-	if len(pkt.Payload) != SamplesPerFrame {
-		t.Fatalf("silence payload length = %d, want %d", len(pkt.Payload), SamplesPerFrame)
-	}
-	for i, b := range pkt.Payload {
-		if b != SilenceByte {
-			t.Fatalf("silence payload[%d] = %#x, want %#x", i, b, SilenceByte)
+	for i := range frames {
+		if pkt := readPacket(t, peer); pkt.Marker {
+			t.Fatalf("packet %d set the marker bit; media must never signal a talkspurt start", i)
 		}
 	}
 }
 
-func TestPortWriteMethodsToleratesNilReceiver(t *testing.T) {
+func TestPortWriteFrameDoesNotSplitOrPace(t *testing.T) {
+	port, peer := writeFramePortAndPeer(t, SamplesPerFrame)
+
+	// One call, one packet, sent immediately: pacing belongs to the caller,
+	// which owns the single media clock.
+	frame := make([]byte, SamplesPerFrame)
+	for i := range frame {
+		frame[i] = byte(i)
+	}
+	start := time.Now()
+	for i := 0; i < 5; i++ {
+		if err := port.WriteFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("WriteFrame blocked for %s; it must not pace", elapsed)
+	}
+	for i := 0; i < 5; i++ {
+		pkt := readPacket(t, peer)
+		if len(pkt.Payload) != SamplesPerFrame {
+			t.Fatalf("packet %d payload length = %d, want %d unsplit", i, len(pkt.Payload), SamplesPerFrame)
+		}
+	}
+}
+
+func TestPortWriteFrameToleratesNilReceiver(t *testing.T) {
 	var port *Port
-	if err := port.WritePayload([]byte{1, 2, 3}); err != nil {
-		t.Fatalf("WritePayload on nil port = %v, want nil", err)
+	if err := port.WriteFrame([]byte{1, 2, 3}); err != nil {
+		t.Fatalf("WriteFrame on nil port = %v, want nil", err)
 	}
-	if err := port.WriteSilenceFrame(); err != nil {
-		t.Fatalf("WriteSilenceFrame on nil port = %v, want nil", err)
+	if got := port.FrameBytes(); got != SamplesPerFrame {
+		t.Fatalf("FrameBytes on nil port = %d, want %d", got, SamplesPerFrame)
 	}
+}
+
+func TestNewSilenceFrameIsAFullFrameOfPCMUSilence(t *testing.T) {
+	frame := NewSilenceFrame()
+	if len(frame) != SamplesPerFrame {
+		t.Fatalf("silence frame length = %d, want %d", len(frame), SamplesPerFrame)
+	}
+	for i, b := range frame {
+		if b != SilenceByte {
+			t.Fatalf("silence frame[%d] = %#x, want %#x", i, b, SilenceByte)
+		}
+	}
+}
+
+func writeFramePortAndPeer(t *testing.T, frameBytes int) (*Port, *net.UDPConn) {
+	t.Helper()
+	port, err := Listen(Config{
+		ListenIP: "127.0.0.1",
+		// Constrained to the unprivileged ephemeral range: with no bounds,
+		// Listen picks anywhere in 1-65535 and intermittently fails to bind
+		// a privileged port.
+		PortMin:             20000,
+		PortMax:             40000,
+		PayloadType:         0,
+		OutboundFrameBytes:  frameBytes,
+		MediaTimeoutInitial: time.Second,
+		MediaTimeout:        time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { port.Close() })
+
+	peer, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { peer.Close() })
+	port.SetRemote(peer.LocalAddr().(*net.UDPAddr))
+	return port, peer
 }
 
 func TestListenUsesEvenRTPPortAndSkipsBusyPorts(t *testing.T) {
